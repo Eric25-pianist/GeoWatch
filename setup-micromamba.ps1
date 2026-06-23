@@ -12,6 +12,63 @@ if (-not $RootPrefix) {
 }
 $RootPrefix = [System.IO.Path]::GetFullPath($RootPrefix)
 
+function Get-TarExecutable {
+    $TarCommand = Get-Command tar.exe -ErrorAction SilentlyContinue
+    if (-not $TarCommand) {
+        $TarCommand = Get-Command tar -ErrorAction SilentlyContinue
+    }
+    if (-not $TarCommand) {
+        throw (
+            "Windows tar.exe was not found. Install a recent version of Windows " +
+            "or extract the project on a system where tar.exe is available."
+        )
+    }
+    return $TarCommand.Source
+}
+
+function Install-ProjectMicromamba {
+    param(
+        [Parameter(Mandatory = $true)][string]$ToolsDirectory,
+        [Parameter(Mandatory = $true)][string]$Archive,
+        [Parameter(Mandatory = $true)][string]$Micromamba
+    )
+
+    New-Item -ItemType Directory -Force -Path $ToolsDirectory | Out-Null
+    $TarExecutable = Get-TarExecutable
+    $DownloadUrl = "https://micro.mamba.pm/api/micromamba/win-64/latest"
+
+    foreach ($Attempt in 1..2) {
+        if ((-not (Test-Path $Archive)) -or $Attempt -gt 1) {
+            if (Test-Path $Archive) {
+                Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "Downloading a project-local Micromamba runtime..."
+            Invoke-WebRequest -Uri $DownloadUrl -OutFile $Archive
+        }
+
+        foreach ($PartialPath in @(
+            (Join-Path $ToolsDirectory "Library"),
+            (Join-Path $ToolsDirectory "info")
+        )) {
+            if (Test-Path $PartialPath) {
+                Remove-Item -LiteralPath $PartialPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        & $TarExecutable -xjf $Archive -C $ToolsDirectory
+        $ExtractExitCode = $LASTEXITCODE
+        if ($ExtractExitCode -eq 0 -and (Test-Path $Micromamba)) {
+            return
+        }
+    }
+
+    throw (
+        "Micromamba archive extraction failed. Delete the .tools folder and try " +
+        "again. If the issue continues, run tar.exe manually to inspect the " +
+        "Windows extraction error."
+    )
+}
+
 $MicromambaCommand = Get-Command micromamba -ErrorAction SilentlyContinue
 if ($MicromambaCommand) {
     $Micromamba = $MicromambaCommand.Source
@@ -20,15 +77,10 @@ if ($MicromambaCommand) {
     $Archive = Join-Path $ToolsDirectory "micromamba.tar.bz2"
     $Micromamba = Join-Path $ToolsDirectory "Library\bin\micromamba.exe"
     if (-not (Test-Path $Micromamba)) {
-        New-Item -ItemType Directory -Force -Path $ToolsDirectory | Out-Null
-        Write-Host "Downloading a project-local Micromamba runtime..."
-        Invoke-WebRequest `
-            -Uri "https://micro.mamba.pm/api/micromamba/win-64/latest" `
-            -OutFile $Archive
-        tar -xjf $Archive -C $ToolsDirectory
-        if ($LASTEXITCODE -ne 0) {
-            throw "Micromamba archive extraction failed with exit code $LASTEXITCODE."
-        }
+        Install-ProjectMicromamba `
+            -ToolsDirectory $ToolsDirectory `
+            -Archive $Archive `
+            -Micromamba $Micromamba
     }
     if (-not (Test-Path $Micromamba)) {
         throw "Micromamba executable was not found at $Micromamba."
