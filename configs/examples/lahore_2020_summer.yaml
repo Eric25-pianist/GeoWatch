@@ -1,0 +1,50 @@
+project_name: lahore-2020-summer
+aoi:
+  kind: geojson
+  path: lahore_boundary.geojson
+  crs: EPSG:4326
+dates:
+  start_date: 2020-06-01
+  end_date: 2020-09-30
+acquisition:
+  enabled: true
+  download: true
+  provider: auto
+  datasets:
+    - sentinel-2-l2a
+    - landsat-8-c2-l2
+    - landsat-9-c2-l2
+  max_cloud_cover: 20.0
+  max_results: 10
+  max_downloads: 6
+  download_directory: data/lahore/2020/raw
+  metadata_catalog: outputs/lahore_2020/manifests/acquisition_catalog.json
+  acquisition_report: outputs/lahore_2020/reports/acquisition_report.md
+  request_timeout_seconds: 30.0
+  retry_attempts: 3
+  retry_backoff_seconds: 0.5
+  max_download_bytes: 2147483648
+  preferred_asset_roles:
+    - data
+    - visual
+    - thumbnail
+outputs:
+  root: outputs/lahore_2020
+  rasters: outputs/lahore_2020/rasters
+  vectors: outputs/lahore_2020/vectors
+  maps: outputs/lahore_2020/maps
+  reports: outputs/lahore_2020/reports
+  statistics: outputs/lahore_2020/statistics
+  manifests: outputs/lahore_2020/manifests
+  exports: outputs/lahore_2020/exports
+processing:
+  target_crs: EPSG:3857
+  tile_size: 1024
+  max_cloud_cover: 20.0
+  max_workers: 1
+  dry_run: true
+logging:
+  directory: logs/lahore_2020
+  level: INFO
+  rotation: 10 MB
+  retention: 14 days

@@ -1,0 +1,256 @@
+{
+  "$defs": {
+    "AOIConfig": {
+      "description": "Area-of-interest configuration using either a bbox or vector file.",
+      "properties": {
+        "kind": {
+          "default": "bbox",
+          "enum": [
+            "bbox",
+            "geojson",
+            "shapefile",
+            "geopackage"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "bbox": {
+          "anyOf": [
+            {
+              "maxItems": 4,
+              "minItems": 4,
+              "prefixItems": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                }
+              ],
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bounding box as west, south, east, north in EPSG:4326.",
+          "title": "Bbox"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to AOI vector data.",
+          "title": "Path"
+        },
+        "crs": {
+          "default": "EPSG:4326",
+          "description": "AOI coordinate reference system.",
+          "title": "Crs",
+          "type": "string"
+        }
+      },
+      "title": "AOIConfig",
+      "type": "object"
+    },
+    "DateRangeConfig": {
+      "description": "Temporal range for a foundation validation run.",
+      "properties": {
+        "start_date": {
+          "format": "date",
+          "title": "Start Date",
+          "type": "string"
+        },
+        "end_date": {
+          "format": "date",
+          "title": "End Date",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_date",
+        "end_date"
+      ],
+      "title": "DateRangeConfig",
+      "type": "object"
+    },
+    "LoggingConfig": {
+      "description": "Log destination settings.",
+      "properties": {
+        "directory": {
+          "format": "path",
+          "title": "Directory",
+          "type": "string"
+        },
+        "level": {
+          "default": "INFO",
+          "enum": [
+            "TRACE",
+            "DEBUG",
+            "INFO",
+            "WARNING",
+            "ERROR"
+          ],
+          "title": "Level",
+          "type": "string"
+        },
+        "rotation": {
+          "default": "10 MB",
+          "title": "Rotation",
+          "type": "string"
+        },
+        "retention": {
+          "default": "14 days",
+          "title": "Retention",
+          "type": "string"
+        }
+      },
+      "title": "LoggingConfig",
+      "type": "object"
+    },
+    "OutputConfig": {
+      "description": "Output directory configuration for Phase 1.",
+      "properties": {
+        "root": {
+          "format": "path",
+          "title": "Root",
+          "type": "string"
+        },
+        "rasters": {
+          "format": "path",
+          "title": "Rasters",
+          "type": "string"
+        },
+        "vectors": {
+          "format": "path",
+          "title": "Vectors",
+          "type": "string"
+        },
+        "maps": {
+          "format": "path",
+          "title": "Maps",
+          "type": "string"
+        },
+        "reports": {
+          "format": "path",
+          "title": "Reports",
+          "type": "string"
+        },
+        "statistics": {
+          "format": "path",
+          "title": "Statistics",
+          "type": "string"
+        },
+        "manifests": {
+          "format": "path",
+          "title": "Manifests",
+          "type": "string"
+        }
+      },
+      "title": "OutputConfig",
+      "type": "object"
+    },
+    "ProcessingConfig": {
+      "description": "Processing settings that can be validated before later phases exist.",
+      "properties": {
+        "target_crs": {
+          "default": "EPSG:3857",
+          "title": "Target Crs",
+          "type": "string"
+        },
+        "tile_size": {
+          "default": 1024,
+          "maximum": 16384,
+          "minimum": 128,
+          "title": "Tile Size",
+          "type": "integer"
+        },
+        "max_cloud_cover": {
+          "default": 20.0,
+          "maximum": 100.0,
+          "minimum": 0.0,
+          "title": "Max Cloud Cover",
+          "type": "number"
+        },
+        "max_workers": {
+          "default": 1,
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Max Workers",
+          "type": "integer"
+        },
+        "dry_run": {
+          "default": true,
+          "title": "Dry Run",
+          "type": "boolean"
+        }
+      },
+      "title": "ProcessingConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Top-level GeoWatch project configuration.",
+  "examples": [
+    {
+      "aoi": {
+        "bbox": [
+          74.15,
+          31.35,
+          74.55,
+          31.7
+        ],
+        "crs": "EPSG:4326",
+        "kind": "bbox"
+      },
+      "dates": {
+        "end_date": "2024-01-31",
+        "start_date": "2024-01-01"
+      },
+      "project_name": "lahore-foundation-example"
+    }
+  ],
+  "properties": {
+    "project_name": {
+      "default": "geowatch-project",
+      "minLength": 1,
+      "title": "Project Name",
+      "type": "string"
+    },
+    "aoi": {
+      "$ref": "#/$defs/AOIConfig"
+    },
+    "dates": {
+      "$ref": "#/$defs/DateRangeConfig"
+    },
+    "outputs": {
+      "$ref": "#/$defs/OutputConfig"
+    },
+    "processing": {
+      "$ref": "#/$defs/ProcessingConfig"
+    },
+    "logging": {
+      "$ref": "#/$defs/LoggingConfig"
+    }
+  },
+  "required": [
+    "aoi",
+    "dates"
+  ],
+  "title": "ProjectConfig",
+  "type": "object"
+}

@@ -1,0 +1,23 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "lahore-city"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [74.15, 31.35],
+            [74.55, 31.35],
+            [74.55, 31.7],
+            [74.15, 31.7],
+            [74.15, 31.35]
+          ]
+        ]
+      }
+    }
+  ]
+}

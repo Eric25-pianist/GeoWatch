@@ -1,0 +1,49 @@
+project_name: sample-aoi-file-example
+aoi:
+  kind: geojson
+  path: ../../tests/fixtures/sample_data/sample_aoi.geojson
+  crs: EPSG:4326
+dates:
+  start_date: 2024-01-01
+  end_date: 2024-01-31
+acquisition:
+  enabled: true
+  download: false
+  provider: auto
+  datasets:
+    - sentinel-2-l2a
+    - landsat-8-c2-l2
+    - landsat-9-c2-l2
+  max_cloud_cover: 20.0
+  max_results: 10
+  max_downloads: 1
+  download_directory: data/raw
+  metadata_catalog: outputs/manifests/acquisition_catalog.json
+  acquisition_report: outputs/reports/acquisition_report.md
+  request_timeout_seconds: 30.0
+  retry_attempts: 3
+  retry_backoff_seconds: 0.5
+  max_download_bytes: 2147483648
+  preferred_asset_roles:
+    - data
+    - visual
+    - thumbnail
+outputs:
+  root: outputs
+  rasters: outputs/rasters
+  vectors: outputs/vectors
+  maps: outputs/maps
+  reports: outputs/reports
+  statistics: outputs/statistics
+  manifests: outputs/manifests
+processing:
+  target_crs: EPSG:3857
+  tile_size: 1024
+  max_cloud_cover: 20.0
+  max_workers: 1
+  dry_run: true
+logging:
+  directory: logs
+  level: INFO
+  rotation: 10 MB
+  retention: 14 days

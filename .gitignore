@@ -1,0 +1,70 @@
+# Local Python and GIS environments
+.venv/
+venv/
+env/
+.mamba-root/
+.tools/
+
+# Python caches and editable/build metadata
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+wheelhouse/
+
+# Test, lint, type-check, and coverage artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+
+# GeoWatch runtime and generated products
+outputs/
+data/
+logs/
+tmp/
+.tmp/
+*.log
+*.part
+*.verified.json
+PHASE_REPORT.md
+BUILD_REPORT.md
+
+# Local configuration, credentials, and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.yml
+secrets.yaml
+secrets.json
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary archives and installer downloads
+*.tmp
+*.temp
+*.bak
+*.tar
+*.tar.gz
+*.tar.bz2
+*.zip

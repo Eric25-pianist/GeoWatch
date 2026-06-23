@@ -1,0 +1,8 @@
+services:
+  geowatch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app
+    command: geowatch validate configs/default.yaml

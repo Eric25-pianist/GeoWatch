@@ -1,0 +1,13 @@
+line-length = 88
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "ARG", "PTH", "TRY", "RUF"]
+ignore = ["TRY003", "TRY300", "UP036"]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = ["ARG001"]
+"src/geowatch/reporting/cartography.py" = ["E501"]
+"src/geowatch/reporting/demo.py" = ["E501"]
+"src/geowatch/reporting/exports.py" = ["E501"]
+"src/geowatch/reporting/phase5.py" = ["E501"]
