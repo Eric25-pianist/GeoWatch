@@ -42,6 +42,7 @@ def build_year_composite(
     target_crs: str = "auto",
     max_pixels: int = DEFAULT_MAX_PIXELS,
     min_valid_coverage: float = 0.70,
+    hard_min_valid_coverage: float = 0.20,
 ) -> RasterLayer:
     """Create one harmonized yearly reflectance composite from downloaded assets."""
     if importlib.util.find_spec("rasterio") is None:
@@ -103,13 +104,25 @@ def build_year_composite(
     inside_pixels = int(inside.sum())
     valid_inside = int((inside & np.isfinite(data[0])).sum())
     valid_coverage = valid_inside / inside_pixels if inside_pixels else 0.0
-    if valid_coverage < min_valid_coverage:
+    if valid_coverage < hard_min_valid_coverage:
         raise GeoWatchError(
             f"{year} composite has only {valid_coverage:.1%} valid AOI coverage; "
-            f"minimum is {min_valid_coverage:.1%}."
+            f"hard minimum is {hard_min_valid_coverage:.1%}. Try a wider season, "
+            "a higher cloud ceiling, more scenes, or a newer sensor."
         )
+    quality_warnings: list[str] = []
+    if valid_coverage < min_valid_coverage:
+        warning = (
+            f"{year} composite has {valid_coverage:.1%} valid AOI coverage, below "
+            f"the recommended {min_valid_coverage:.1%} target. GeoWatch will "
+            "continue and mark the run as lower quality."
+        )
+        quality_warnings.append(warning)
+        logger.warning(warning)
     finite = data[:, inside & np.isfinite(data[0])]
-    outside_physical_range = int(((finite < 0.0) | (finite > 1.0)).sum())
+    outside_physical_range = (
+        int(((finite < 0.0) | (finite > 1.0)).sum()) if finite.size else 0
+    )
     raw_catalog_scenes = catalog.get("scenes", [])
     catalog_scenes = raw_catalog_scenes if isinstance(raw_catalog_scenes, list) else []
     result = RasterLayer(
@@ -124,7 +137,9 @@ def build_year_composite(
             "resolution_m": resolution,
             "catalog": str(catalog_path),
             "valid_aoi_fraction": valid_coverage,
-            "minimum_valid_aoi_fraction": min_valid_coverage,
+            "recommended_valid_aoi_fraction": min_valid_coverage,
+            "hard_minimum_valid_aoi_fraction": hard_min_valid_coverage,
+            "quality_warnings": tuple(quality_warnings),
             "saturated_pixels_masked": sum(
                 _integer_metadata(scene, "saturated_pixels") for scene in scenes
             ),

@@ -19,8 +19,9 @@ from geowatch.application.sensors import SensorProfile
 from geowatch.core.errors import GeoWatchError
 from geowatch.utils.geometry import load_vector_geometry, reproject_geometry
 
-TARGET_AOI_COVERAGE = 0.95
-AUTOMATIC_TILE_SCENE_LIMIT = 12
+IDEAL_AOI_COVERAGE = 0.95
+MINIMUM_AOI_COVERAGE = 0.50
+AUTOMATIC_TILE_SCENE_LIMIT = 20
 
 
 class YearAvailability(BaseModel):
@@ -96,12 +97,10 @@ def build_availability_plan(
             request_timeout_seconds=60.0,
         ),
     )
-    minimum = (
-        min(3, spec.imagery.max_scenes_per_year)
-        if profile.dataset == "landsat-7-c2-l2"
-        else 1
-    )
+    minimum = 1
+    recommended = _recommended_scene_count(profile.dataset)
     attempts = _candidate_policies(spec)
+    candidates: list[AvailabilityPlan] = []
     for start_month, end_month, cloud_limit in attempts:
         yearly: dict[int, YearAvailability] = {}
         successful = True
@@ -128,24 +127,67 @@ def build_availability_plan(
                 end_month,
                 cloud_limit,
                 yearly,
+                recommended_scene_count=recommended,
             )
-            plan = AvailabilityPlan(
-                dataset=profile.dataset,
-                requested_start_month=spec.temporal.start_month,
-                requested_end_month=spec.temporal.end_month,
-                requested_cloud_cover=spec.imagery.max_cloud_cover,
-                effective_start_month=start_month,
-                effective_end_month=end_month,
-                effective_cloud_cover=cloud_limit,
-                minimum_scenes_per_year=minimum,
-                years=yearly,
-                fallback_messages=messages,
+            candidates.append(
+                AvailabilityPlan(
+                    dataset=profile.dataset,
+                    requested_start_month=spec.temporal.start_month,
+                    requested_end_month=spec.temporal.end_month,
+                    requested_cloud_cover=spec.imagery.max_cloud_cover,
+                    effective_start_month=start_month,
+                    effective_end_month=end_month,
+                    effective_cloud_cover=cloud_limit,
+                    minimum_scenes_per_year=minimum,
+                    years=yearly,
+                    fallback_messages=messages,
+                )
             )
-            logger.info("Selected imagery availability plan\n{}", plan.summary())
-            return plan
+    if candidates:
+        plan = max(
+            candidates,
+            key=lambda candidate: _plan_rank(candidate, spec, recommended),
+        )
+        logger.info("Selected imagery availability plan\n{}", plan.summary())
+        return plan
     raise GeoWatchError(
         "No common imagery policy supplies sufficient mission-consistent scenes "
-        "for every requested year. Try a wider season or a different sensor."
+        "for every requested year, even after automatic cloud and season fallback. "
+        "Try a newer year range, a smaller AOI, Sentinel-2 for 2015+, or a local "
+        "boundary with a tighter extent."
+    )
+
+
+def _recommended_scene_count(dataset: str) -> int:
+    """Return the preferred scene count before marking a fallback lower quality."""
+    return 3 if dataset == "landsat-7-c2-l2" else 1
+
+
+def _plan_rank(
+    plan: AvailabilityPlan,
+    spec: RunSpecification,
+    recommended_scene_count: int,
+) -> tuple[bool, float, float, int, float]:
+    """Rank plans by robustness before convenience."""
+    scene_sufficiency = sum(
+        min(item.scene_count / recommended_scene_count, 1.0)
+        for item in plan.years.values()
+    ) / max(len(plan.years), 1)
+    mean_coverage = sum(item.aoi_coverage for item in plan.years.values()) / max(
+        len(plan.years), 1
+    )
+    all_recommended = all(
+        item.scene_count >= recommended_scene_count for item in plan.years.values()
+    )
+    seasonal_delta = abs(plan.effective_start_month - spec.temporal.start_month) + abs(
+        plan.effective_end_month - spec.temporal.end_month
+    )
+    return (
+        all_recommended,
+        scene_sufficiency,
+        mean_coverage,
+        -seasonal_delta,
+        -plan.effective_cloud_cover,
     )
 
 
@@ -169,7 +211,7 @@ def _search_year(
         datasets=(profile.dataset,),
         max_cloud_cover=cloud_limit,
         limit=(
-            500 if profile.dataset == "sentinel-2-l2a" else max(50, max_scenes * 10)
+            500 if profile.dataset == "sentinel-2-l2a" else max(200, max_scenes * 25)
         ),
     )
     scenes = provider.search(query)  # type: ignore[attr-defined]
@@ -183,19 +225,29 @@ def _search_year(
     complete = tuple(
         scene
         for scene in ranked
-        if _scene_geometry_coverage(scene, geometry) >= TARGET_AOI_COVERAGE
+        if _scene_geometry_coverage(scene, geometry) >= IDEAL_AOI_COVERAGE
     )
     if complete:
         return complete[:max_scenes]
-    return _select_multitile_mosaic(
+    same_day = _select_same_day_mosaic(
         ranked,
         geometry,
         midpoint,
         max_scenes=max(max_scenes, AUTOMATIC_TILE_SCENE_LIMIT),
     )
+    if same_day:
+        return same_day
+    seasonal, coverage = _greedy_cover(
+        ranked,
+        geometry,
+        max_scenes=max(max_scenes, AUTOMATIC_TILE_SCENE_LIMIT),
+    )
+    if coverage >= MINIMUM_AOI_COVERAGE:
+        return seasonal
+    return ()
 
 
-def _select_multitile_mosaic(
+def _select_same_day_mosaic(
     scenes: tuple[SceneMetadata, ...],
     geometry: BaseGeometry,
     midpoint: datetime,
@@ -215,7 +267,7 @@ def _select_multitile_mosaic(
             geometry,
             max_scenes=max_scenes,
         )
-        if coverage < TARGET_AOI_COVERAGE:
+        if coverage < IDEAL_AOI_COVERAGE:
             continue
         clouds = [
             scene.cloud_cover for scene in selected if scene.cloud_cover is not None
@@ -256,7 +308,7 @@ def _greedy_cover(
         remaining.remove(scene)
         covered = expanded
         coverage = covered.area / geometry.area if geometry.area else 0.0
-        if coverage >= TARGET_AOI_COVERAGE:
+        if coverage >= IDEAL_AOI_COVERAGE:
             return tuple(selected), coverage
     coverage = covered.area / geometry.area if geometry.area else 0.0
     return tuple(selected), coverage
@@ -296,15 +348,23 @@ def _candidate_policies(
     spec: RunSpecification,
 ) -> tuple[tuple[int, int, float], ...]:
     requested = spec.imagery.max_cloud_cover
-    expanded_start = max(1, spec.temporal.start_month - 1)
-    expanded_end = min(12, spec.temporal.end_month + 1)
-    raw = (
-        (spec.temporal.start_month, spec.temporal.end_month, requested),
-        (spec.temporal.start_month, spec.temporal.end_month, max(requested, 40.0)),
-        (expanded_start, expanded_end, requested),
-        (expanded_start, expanded_end, max(requested, 40.0)),
-        (spec.temporal.start_month, spec.temporal.end_month, max(requested, 60.0)),
-        (expanded_start, expanded_end, max(requested, 60.0)),
+    windows = (
+        (spec.temporal.start_month, spec.temporal.end_month),
+        (
+            max(1, spec.temporal.start_month - 1),
+            min(12, spec.temporal.end_month + 1),
+        ),
+        (
+            max(1, spec.temporal.start_month - 2),
+            min(12, spec.temporal.end_month + 2),
+        ),
+        (1, 12),
+    )
+    clouds = (requested, max(requested, 40.0), max(requested, 60.0), 80.0, 100.0)
+    raw = tuple(
+        (start_month, end_month, cloud)
+        for start_month, end_month in windows
+        for cloud in clouds
     )
     return tuple(dict.fromkeys(raw))
 
@@ -315,6 +375,8 @@ def _fallback_messages(
     end_month: int,
     cloud_limit: float,
     yearly: dict[int, YearAvailability],
+    *,
+    recommended_scene_count: int,
 ) -> tuple[str, ...]:
     messages: list[str] = []
     if cloud_limit != spec.imagery.max_cloud_cover:
@@ -331,12 +393,38 @@ def _fallback_messages(
             f"{spec.temporal.start_month}-{spec.temporal.end_month} to "
             f"{start_month}-{end_month}"
         )
+    if (start_month, end_month) == (1, 12):
+        messages.append(
+            "seasonal fallback expanded to the full year; interpret seasonal "
+            "change with extra caution"
+        )
+    if cloud_limit >= 80.0:
+        messages.append(
+            "high scene-cloud fallback was required; pixel-level QA masking and "
+            "valid-coverage scoring are especially important"
+        )
     effective_scene_count = max(item.scene_count for item in yearly.values())
     if effective_scene_count > spec.imagery.max_scenes_per_year:
         messages.append(
-            "multi-tile AOI expanded the scene allowance from "
+            "large-AOI/seasonal fallback expanded the scene allowance from "
             f"{spec.imagery.max_scenes_per_year} to {effective_scene_count} "
-            "same-day tiles per year"
+            "scenes per year"
+        )
+    low_coverage_years = [
+        f"{year} ({item.aoi_coverage:.1%})"
+        for year, item in sorted(yearly.items())
+        if item.aoi_coverage < IDEAL_AOI_COVERAGE
+    ]
+    if low_coverage_years:
+        messages.append(
+            "planned footprint coverage is below the ideal 95% threshold for "
+            + ", ".join(low_coverage_years)
+        )
+    if any(item.scene_count < recommended_scene_count for item in yearly.values()):
+        messages.append(
+            f"fewer than the preferred {recommended_scene_count} scene(s) were "
+            "available for at least one year; cloud/SLC-off gaps may remain after "
+            "compositing"
         )
     return tuple(messages)
 

@@ -18,6 +18,7 @@ from geowatch.application.models import (
     TemporalSpec,
 )
 from geowatch.application.project import ProjectLayout, write_run_specification
+from geowatch.application.sensors import SENTINEL_2, required_assets
 from geowatch.application.workflow import process_project, project_status
 from geowatch.processing.models import RasterGrid, RasterLayer
 
@@ -67,22 +68,32 @@ def test_professional_workflow_runs_and_resumes(
     def fake_acquisition(config: Any, **_: Any) -> Any:
         calls["acquire"] += 1
         config.acquisition.metadata_catalog.parent.mkdir(parents=True, exist_ok=True)
-        config.acquisition.metadata_catalog.write_text(
-            '{"scenes": [], "downloads": []}', encoding="utf-8"
-        )
         config.acquisition.acquisition_report.write_text("report", encoding="utf-8")
-        download_path = config.acquisition.download_directory / "asset.tif"
-        download_path.parent.mkdir(parents=True, exist_ok=True)
-        download_path.write_bytes(b"data")
-        download = DownloadResult(
-            scene_id="scene",
-            asset_name="blue",
-            path=download_path,
-            bytes_written=4,
-            verified=True,
+        scene_id = config.acquisition.selected_scene_ids[0]
+        downloads = []
+        for asset_name in required_assets(SENTINEL_2):
+            download_path = (
+                config.acquisition.download_directory / f"{scene_id}_{asset_name}.tif"
+            )
+            download_path.parent.mkdir(parents=True, exist_ok=True)
+            download_path.write_bytes(b"data")
+            downloads.append(
+                DownloadResult(
+                    scene_id=scene_id,
+                    asset_name=asset_name,
+                    path=download_path,
+                    bytes_written=4,
+                    verified=True,
+                )
+            )
+        config.acquisition.metadata_catalog.write_text(
+            '{"scenes": [], "downloads": ['
+            + ",".join(download.model_dump_json() for download in downloads)
+            + "]}",
+            encoding="utf-8",
         )
         return SimpleNamespace(
-            downloads=(download,),
+            downloads=tuple(downloads),
             catalog_path=config.acquisition.metadata_catalog,
             report_path=config.acquisition.acquisition_report,
             provider="planetary-computer",

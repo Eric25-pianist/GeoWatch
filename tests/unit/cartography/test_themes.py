@@ -89,3 +89,46 @@ def test_render_cartography_suite_uses_selected_theme(
     assert artifacts["ndvi"].metadata["map_theme"] == "government"
     assert artifacts["before_after"].metadata["map_theme_label"] == "Government Report"
     assert artifacts["change_detection"].files["png_300"].exists()
+
+
+def test_render_cartography_suite_skips_missing_lulc(
+    tmp_path, sample_config_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cartography should still render when classification is disabled."""
+    config = load_config(sample_config_path)
+    inputs = build_demo_publication_inputs(config, width=60, height=40)
+    analytics_report = run_analytics_pipeline(
+        inputs.scene_t1,
+        inputs.scene_t2,
+        output_root=tmp_path / "analytics",
+        classification_method="none",
+    )
+
+    def _fast_save_bundle(*, fig_builder, base_path: Path) -> dict[str, Path]:
+        fig = fig_builder(80)
+        output_path = base_path.with_name(f"{base_path.name}_smoke.png")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=80)
+        plt.close(fig)
+        return {"png_300": output_path}
+
+    monkeypatch.setattr(
+        "geowatch.reporting.cartography._save_figure_bundle",
+        _fast_save_bundle,
+    )
+    monkeypatch.setattr(
+        "geowatch.reporting.cartography._save_slider_images",
+        lambda *_args, **_kwargs: {},
+    )
+
+    artifacts = render_cartography_suite(
+        config,
+        inputs.scene_t1,
+        inputs.scene_t2,
+        analytics_report,
+        output_dir=tmp_path / "maps",
+    )
+
+    assert "lulc" not in artifacts
+    assert artifacts["ndvi"].files["png_300"].exists()
+    assert artifacts["before_after"].files["png_300"].exists()

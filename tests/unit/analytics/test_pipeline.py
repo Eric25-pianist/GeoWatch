@@ -38,3 +38,25 @@ def test_run_analytics_pipeline_writes_outputs(
     report_text = report.artifacts["analytics_report"].read_text(encoding="utf-8")
     assert "GeoWatch Phase 4 Report" in report_text
     assert "Transition Matrix" in report_text
+
+
+def test_run_analytics_pipeline_can_skip_classification(
+    tmp_path: Path,
+    scene_t1: RasterLayer,
+    scene_t2: RasterLayer,
+) -> None:
+    """Users should be able to run indices and change detection without LULC."""
+    report = run_analytics_pipeline(
+        scene_t1,
+        scene_t2,
+        output_root=tmp_path,
+        classification_method="none",
+    )
+
+    assert report.classification_results == {}
+    assert report.transition_result.changed_pixels == 0
+    assert report.artifacts["ndvi_gain_loss_cog"].exists()
+    assert report.artifacts["area_statistics"].exists()
+    assert "transition_json" not in report.artifacts
+    report_text = report.artifacts["analytics_report"].read_text(encoding="utf-8")
+    assert "LULC classification was disabled" in report_text

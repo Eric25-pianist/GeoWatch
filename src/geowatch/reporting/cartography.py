@@ -101,7 +101,9 @@ def render_cartography_suite(
     aoi_geometry, aoi_crs = _load_aoi_geometry(config)
     attribution = _scene_attribution(config, scene_t1, scene_t2)
     primary_change = _select_primary_change_result(analytics_report)
-    hotspot = analyze_hotspots(primary_change.score)
+    hotspot = (
+        analyze_hotspots(primary_change.score) if primary_change is not None else None
+    )
     reference_rgb = _scene_to_rgb(scene_t2, max_dimension=1800)
     t1_label = _scene_display_label(scene_t1)
     t2_label = _scene_display_label(scene_t2)
@@ -150,52 +152,59 @@ def render_cartography_suite(
             theme=theme,
         )
 
-    lulc_result = analytics_report.classification_results["lulc_t2"]
-    display_class_names = _cartographic_class_names(
-        lulc_result.class_names,
-        exploratory=lulc_result.method in {"kmeans", "isodata"},
-    )
-    artifacts["lulc"] = _render_classification_map(
-        name="lulc",
-        title="LULC",
-        description="Land-use and land-cover classification for the after scene.",
-        labels=lulc_result.labels,
-        class_names=display_class_names,
-        grid=scene_t2.grid,
-        output_dir=output_dir / "lulc",
-        project_name=config.project_name,
-        subtitle=f"{t2_label} | Exploratory LULC classification",
-        attribution=f"{attribution} | Exploratory unsupervised LULC",
-        aoi_geometry=aoi_geometry,
-        aoi_crs=aoi_crs,
-        reference_rgb=reference_rgb,
-        theme=theme,
-    )
+    lulc_result = analytics_report.classification_results.get("lulc_t2")
+    if lulc_result is not None:
+        display_class_names = _cartographic_class_names(
+            lulc_result.class_names,
+            exploratory=lulc_result.method in {"kmeans", "isodata"},
+        )
+        artifacts["lulc"] = _render_classification_map(
+            name="lulc",
+            title="LULC",
+            description="Land-use and land-cover classification for the after scene.",
+            labels=lulc_result.labels,
+            class_names=display_class_names,
+            grid=scene_t2.grid,
+            output_dir=output_dir / "lulc",
+            project_name=config.project_name,
+            subtitle=f"{t2_label} | Exploratory LULC classification",
+            attribution=f"{attribution} | Exploratory unsupervised LULC",
+            aoi_geometry=aoi_geometry,
+            aoi_crs=aoi_crs,
+            reference_rgb=reference_rgb,
+            theme=theme,
+        )
+    else:
+        logger.info("Skipping LULC map because no LULC result is available.")
 
-    artifacts["change_detection"] = _render_change_map(
-        primary_change,
-        grid=scene_t2.grid,
-        output_dir=output_dir / "change_detection",
-        project_name=config.project_name,
-        subtitle=f"{primary_change.method.upper()} | {t1_label} to {t2_label}",
-        attribution=attribution,
-        aoi_geometry=aoi_geometry,
-        aoi_crs=aoi_crs,
-        reference_rgb=reference_rgb,
-        theme=theme,
-    )
-    artifacts["hotspot_analysis"] = _render_hotspot_map(
-        hotspot,
-        grid=scene_t2.grid,
-        output_dir=output_dir / "hotspot_analysis",
-        project_name=config.project_name,
-        subtitle=f"Getis-Ord Gi* | {t1_label} to {t2_label}",
-        attribution=attribution,
-        aoi_geometry=aoi_geometry,
-        aoi_crs=aoi_crs,
-        reference_rgb=reference_rgb,
-        theme=theme,
-    )
+    if primary_change is not None:
+        artifacts["change_detection"] = _render_change_map(
+            primary_change,
+            grid=scene_t2.grid,
+            output_dir=output_dir / "change_detection",
+            project_name=config.project_name,
+            subtitle=f"{primary_change.method.upper()} | {t1_label} to {t2_label}",
+            attribution=attribution,
+            aoi_geometry=aoi_geometry,
+            aoi_crs=aoi_crs,
+            reference_rgb=reference_rgb,
+            theme=theme,
+        )
+    else:
+        logger.info("Skipping change map because no change result is available.")
+    if hotspot is not None:
+        artifacts["hotspot_analysis"] = _render_hotspot_map(
+            hotspot,
+            grid=scene_t2.grid,
+            output_dir=output_dir / "hotspot_analysis",
+            project_name=config.project_name,
+            subtitle=f"Getis-Ord Gi* | {t1_label} to {t2_label}",
+            attribution=attribution,
+            aoi_geometry=aoi_geometry,
+            aoi_crs=aoi_crs,
+            reference_rgb=reference_rgb,
+            theme=theme,
+        )
     artifacts["before_after"] = _render_before_after_map(
         scene_t1,
         scene_t2,
@@ -304,8 +313,7 @@ def _render_continuous_map(
     """Render a continuous thematic map with a colorbar."""
     output_dir.mkdir(parents=True, exist_ok=True)
     array = np.asarray(values, dtype=np.float32)
-    vmin = float(np.nanpercentile(array, 2.0))
-    vmax = float(np.nanpercentile(array, 98.0))
+    vmin, vmax = _display_bounds(array)
     files = _save_figure_bundle(
         fig_builder=lambda dpi: _build_continuous_figure(
             array=array,
@@ -442,8 +450,7 @@ def _render_change_map(
     output_dir.mkdir(parents=True, exist_ok=True)
     values = np.asarray(change_result.score, dtype=np.float32)
     threshold = change_result.threshold
-    vmin = float(np.nanpercentile(values, 2.0))
-    vmax = float(np.nanpercentile(values, 98.0))
+    vmin, vmax = _display_bounds(values)
     files = _save_figure_bundle(
         fig_builder=lambda dpi: _build_change_figure(
             values=values,
@@ -505,8 +512,7 @@ def _render_hotspot_map(
 ) -> MapArtifact:
     """Render a hotspot analysis map from a Gi* surface."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    vmin = float(np.nanpercentile(hotspot.gi_star, 2.0))
-    vmax = float(np.nanpercentile(hotspot.gi_star, 98.0))
+    vmin, vmax = _display_bounds(hotspot.gi_star)
     files = _save_figure_bundle(
         fig_builder=lambda dpi: _build_hotspot_figure(
             hotspot=hotspot,
@@ -652,12 +658,12 @@ def _save_figure_bundle(
 ) -> dict[str, Path]:
     """Save a figure in the required export formats and return the file map."""
     files: dict[str, Path] = {}
+    vector_pdf: Path | None = None
+    vector_svg: Path | None = None
     for dpi in (300, 600):
         fig = fig_builder(dpi)
         png_path = base_path.with_name(f"{base_path.name}_{dpi}dpi.png")
         jpeg_path = base_path.with_name(f"{base_path.name}_{dpi}dpi.jpg")
-        pdf_path = base_path.with_name(f"{base_path.name}_{dpi}dpi.pdf")
-        svg_path = base_path.with_name(f"{base_path.name}_{dpi}dpi.svg")
         fig.savefig(png_path, dpi=dpi, bbox_inches="tight", pad_inches=0.15)
         fig.savefig(
             jpeg_path,
@@ -666,12 +672,15 @@ def _save_figure_bundle(
             pad_inches=0.15,
             facecolor="white",
         )
-        fig.savefig(pdf_path, dpi=dpi, bbox_inches="tight", pad_inches=0.15)
-        fig.savefig(svg_path, dpi=dpi, bbox_inches="tight", pad_inches=0.15)
+        if vector_pdf is None or vector_svg is None:
+            vector_pdf = base_path.with_name(f"{base_path.name}.pdf")
+            vector_svg = base_path.with_name(f"{base_path.name}.svg")
+            fig.savefig(vector_pdf, dpi=dpi, bbox_inches="tight", pad_inches=0.15)
+            fig.savefig(vector_svg, dpi=dpi, bbox_inches="tight", pad_inches=0.15)
         files[f"png_{dpi}"] = png_path
         files[f"jpeg_{dpi}"] = jpeg_path
-        files[f"pdf_{dpi}"] = pdf_path
-        files[f"svg_{dpi}"] = svg_path
+        files[f"pdf_{dpi}"] = vector_pdf
+        files[f"svg_{dpi}"] = vector_svg
         plt.close(fig)
     return files
 
@@ -1808,6 +1817,26 @@ def _normalize_band(band: NDArray[np.float32]) -> NDArray[np.float32]:
     return np.asarray(np.clip(normalized, 0.0, 1.0), dtype=np.float32)
 
 
+def _display_bounds(
+    values: NDArray[np.float32],
+    *,
+    default: tuple[float, float] = (0.0, 1.0),
+) -> tuple[float, float]:
+    """Return robust display bounds for sparse or constant rasters."""
+    array = np.asarray(values, dtype=np.float32)
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return default
+    low = float(np.percentile(finite, 2.0))
+    high = float(np.percentile(finite, 98.0))
+    if not np.isfinite(low) or not np.isfinite(high):
+        return default
+    if np.isclose(low, high):
+        padding = max(abs(low) * 0.05, 0.01)
+        return low - padding, high + padding
+    return low, high
+
+
 def _rgb_summary(rgb: NDArray[np.float32]) -> MapStatistics:
     """Summarize an RGB composite for reporting."""
     finite = np.isfinite(rgb)
@@ -1820,12 +1849,12 @@ def _rgb_summary(rgb: NDArray[np.float32]) -> MapStatistics:
 
 def _select_primary_change_result(
     analytics_report: AnalyticsReport,
-) -> ChangeDetectionResult:
+) -> ChangeDetectionResult | None:
     """Choose the most informative change result from the analytics bundle."""
     for preferred in ("mad", "irmad", "index_difference", "cva"):
         if preferred in analytics_report.change_results:
             return analytics_report.change_results[preferred]
-    return next(iter(analytics_report.change_results.values()))
+    return next(iter(analytics_report.change_results.values()), None)
 
 
 def _cartographic_class_names(

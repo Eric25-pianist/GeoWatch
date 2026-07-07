@@ -32,6 +32,7 @@ from geowatch.application.publication import (
 from geowatch.application.scenes import build_year_composite, load_processed_composite
 from geowatch.application.sensors import (
     SENSOR_PROFILES,
+    SensorProfile,
     required_assets,
     select_common_sensor,
 )
@@ -187,8 +188,19 @@ def _acquire_year(
 ) -> Path:
     stage = f"acquisition:{year}"
     catalog = layout.root / "raw" / str(year) / "acquisition_catalog.json"
-    if resume and manifest.is_complete(stage):
+    profile = SENSOR_PROFILES[dataset]
+    selected_scene_ids = availability.years[year].scene_ids
+    if resume and manifest.is_complete(stage) and _catalog_has_complete_downloads(
+        catalog,
+        profile,
+        selected_scene_ids,
+    ):
         return catalog
+    if resume and manifest.is_complete(stage):
+        logger.warning(
+            "Cached acquisition stage for {} is incomplete or stale; reacquiring.",
+            year,
+        )
     manifest.start(stage)
     save_manifest(manifest, layout.manifest)
     try:
@@ -206,10 +218,12 @@ def _acquire_year(
         write_config(config, config_path)
         result = run_acquisition(config, base_dir=layout.root)
         _require_downloads(result.downloads, year)
+        _validate_acquisition_result(result, profile, selected_scene_ids, year)
+        artifacts = [result.catalog_path, result.report_path]
+        artifacts.extend(download.path for download in result.downloads)
         manifest.complete(
             stage,
-            result.catalog_path,
-            result.report_path,
+            *artifacts,
             message=f"{len(result.downloads)} verified assets from {result.provider}",
         )
         save_manifest(manifest, layout.manifest)
@@ -246,7 +260,8 @@ def _process_year(
             output_path=output,
             method=spec.imagery.composite_method,
             target_crs=spec.outputs.target_crs,
-            min_valid_coverage=(0.65 if dataset == "landsat-7-c2-l2" else 0.70),
+            min_valid_coverage=_recommended_valid_coverage(dataset),
+            hard_min_valid_coverage=_hard_minimum_valid_coverage(dataset),
         )
         actual_path = Path(str(layer.metadata["output_path"]))
         manifest.complete(
@@ -462,6 +477,16 @@ def _require_downloads(downloads: object, year: int) -> None:
         raise GeoWatchError(f"No imagery assets were downloaded for {year}.")
 
 
+def _recommended_valid_coverage(dataset: DatasetName) -> float:
+    """Return the quality target used for warnings and score context."""
+    return 0.65 if dataset == "landsat-7-c2-l2" else 0.70
+
+
+def _hard_minimum_valid_coverage(dataset: DatasetName) -> float:
+    """Return the point where an output is too sparse to analyze responsibly."""
+    return 0.20 if dataset == "landsat-7-c2-l2" else 0.25
+
+
 def _prepare_availability(
     spec: RunSpecification,
     layout: ProjectLayout,
@@ -472,14 +497,15 @@ def _prepare_availability(
     resume: bool,
 ) -> AvailabilityPlan:
     """Load or build the common imagery availability plan."""
-    from geowatch.application.sensors import SensorProfile
-
     if not isinstance(profile, SensorProfile):
         raise GeoWatchError("Invalid sensor profile for availability planning.")
     stage = "availability"
     path = layout.root / "availability_plan.json"
     if resume and manifest.is_complete(stage):
-        return AvailabilityPlan.model_validate_json(path.read_text(encoding="utf-8"))
+        plan = _load_cached_availability(path)
+        if _availability_matches_spec(plan, spec, profile):
+            return plan
+        logger.warning("Cached availability plan is stale; rebuilding.")
     manifest.start(stage)
     save_manifest(manifest, layout.manifest)
     try:
@@ -492,3 +518,141 @@ def _prepare_availability(
         manifest.fail(stage, str(exc))
         save_manifest(manifest, layout.manifest)
         raise
+
+
+def _load_cached_availability(path: Path) -> AvailabilityPlan:
+    """Load a cached availability plan with a clear project-level error."""
+    try:
+        return AvailabilityPlan.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GeoWatchError(f"Invalid cached availability plan: {path}") from exc
+
+
+def _availability_matches_spec(
+    plan: AvailabilityPlan,
+    spec: RunSpecification,
+    profile: SensorProfile,
+) -> bool:
+    """Return whether a cached availability plan still matches the run spec."""
+    return (
+        plan.dataset == profile.dataset
+        and plan.requested_start_month == spec.temporal.start_month
+        and plan.requested_end_month == spec.temporal.end_month
+        and abs(plan.requested_cloud_cover - spec.imagery.max_cloud_cover) < 1e-6
+        and tuple(sorted(plan.years)) == spec.temporal.years()
+    )
+
+
+def _validate_acquisition_result(
+    result: object,
+    profile: SensorProfile,
+    selected_scene_ids: tuple[str, ...],
+    year: int,
+) -> None:
+    """Fail early when acquired downloads cannot support processing."""
+    downloads = getattr(result, "downloads", ())
+    grouped = _group_downloads(downloads)
+    expected = selected_scene_ids or tuple(grouped)
+    if not expected:
+        raise GeoWatchError(f"{year} acquisition did not select any scenes.")
+    missing_scenes = [scene_id for scene_id in expected if scene_id not in grouped]
+    if missing_scenes:
+        raise GeoWatchError(
+            f"{year} acquisition missed selected scene(s): "
+            + ", ".join(missing_scenes)
+        )
+    incomplete = [
+        scene_id
+        for scene_id in expected
+        if not _download_group_has_required_assets(grouped[scene_id], profile)
+    ]
+    if incomplete:
+        required = ", ".join(required_assets(profile))
+        raise GeoWatchError(
+            f"{year} acquisition did not download a complete analytical band set "
+            f"for scene(s) {', '.join(incomplete)}. Required assets include: "
+            f"{required}."
+        )
+    bad_files = [
+        str(path)
+        for scene_downloads in grouped.values()
+        for path in scene_downloads.values()
+        if not path.exists() or path.stat().st_size == 0
+    ]
+    if bad_files:
+        raise GeoWatchError(
+            f"{year} acquisition contains missing or empty downloaded files: "
+            + ", ".join(bad_files[:5])
+        )
+
+
+def _catalog_has_complete_downloads(
+    catalog: Path,
+    profile: SensorProfile,
+    selected_scene_ids: tuple[str, ...],
+) -> bool:
+    """Return whether a cached acquisition catalog still has usable downloads."""
+    if not catalog.exists():
+        return False
+    try:
+        payload = json.loads(catalog.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    raw_downloads = payload.get("downloads")
+    if not isinstance(raw_downloads, list):
+        return False
+    grouped = _group_downloads(raw_downloads)
+    expected = selected_scene_ids or tuple(grouped)
+    if not expected or any(scene_id not in grouped for scene_id in expected):
+        return False
+    return all(
+        _download_group_has_required_assets(grouped[scene_id], profile)
+        and all(
+            path.exists() and path.stat().st_size > 0
+            for path in grouped[scene_id].values()
+        )
+        for scene_id in expected
+    )
+
+
+def _group_downloads(downloads: object) -> dict[str, dict[str, Path]]:
+    """Group download-like objects by scene and asset name."""
+    grouped: dict[str, dict[str, Path]] = {}
+    if not isinstance(downloads, (list, tuple)):
+        return grouped
+    for item in downloads:
+        if isinstance(item, dict):
+            scene_id = item.get("scene_id")
+            asset_name = item.get("asset_name")
+            path = item.get("path")
+            verified = item.get("verified", True)
+        else:
+            scene_id = getattr(item, "scene_id", None)
+            asset_name = getattr(item, "asset_name", None)
+            path = getattr(item, "path", None)
+            verified = getattr(item, "verified", True)
+        if (
+            not verified
+            or not isinstance(scene_id, str)
+            or not isinstance(asset_name, str)
+            or path is None
+        ):
+            continue
+        grouped.setdefault(scene_id, {})[asset_name] = Path(path)
+    return grouped
+
+
+def _download_group_has_required_assets(
+    downloads: dict[str, Path],
+    profile: SensorProfile,
+) -> bool:
+    """Return whether a scene download group has all spectral and QA assets."""
+    names = {name.casefold() for name in downloads}
+    for aliases in profile.band_aliases.values():
+        if not any(alias.casefold() in names for alias in aliases):
+            return False
+    if not any(alias.casefold() in names for alias in profile.qa_aliases):
+        return False
+    return not profile.saturation_aliases or any(
+        alias.casefold() in names for alias in profile.saturation_aliases
+    )

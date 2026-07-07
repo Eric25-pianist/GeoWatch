@@ -84,32 +84,40 @@ def run_analytics_pipeline(
         threshold_method=threshold_method,
         threshold_kwargs=threshold_kwargs,
     )
-    scene_indices_t1 = compute_scene_indices(scene_t1)
-    scene_indices_t2 = compute_scene_indices(scene_t2)
-    classification_t1 = classify_lulc(
-        scene_t1,
-        method=classification_method,
-        training_labels=training_labels_t1,
-        index_maps=scene_indices_t1,
-    )
-    classification_t2 = classify_lulc(
-        scene_t2,
-        method=classification_method,
-        training_labels=training_labels_t2,
-        index_maps=scene_indices_t2,
-    )
-    transition_result = build_transition_result(classification_t1, classification_t2)
+    classification_t1: ClassificationResult | None = None
+    classification_t2: ClassificationResult | None = None
+    if classification_method != "none":
+        scene_indices_t1 = compute_scene_indices(scene_t1)
+        scene_indices_t2 = compute_scene_indices(scene_t2)
+        classification_t1 = classify_lulc(
+            scene_t1,
+            method=classification_method,
+            training_labels=training_labels_t1,
+            index_maps=scene_indices_t1,
+        )
+        classification_t2 = classify_lulc(
+            scene_t2,
+            method=classification_method,
+            training_labels=training_labels_t2,
+            index_maps=scene_indices_t2,
+        )
+        transition_result = build_transition_result(
+            classification_t1,
+            classification_t2,
+        )
+    else:
+        transition_result = _empty_transition_result()
     signed_change = _build_signed_ndvi_change(
         index_results["ndvi"], threshold_method=threshold_method
     )
     accuracy: dict[str, AccuracyAssessment] = {}
-    if reference_labels_t1 is not None:
+    if reference_labels_t1 is not None and classification_t1 is not None:
         accuracy["lulc_t1"] = assess_accuracy(
             reference_labels_t1,
             classification_t1.labels,
             class_names=ANALYTICS_CLASS_NAMES,
         )
-    if reference_labels_t2 is not None:
+    if reference_labels_t2 is not None and classification_t2 is not None:
         accuracy["lulc_t2"] = assess_accuracy(
             reference_labels_t2,
             classification_t2.labels,
@@ -134,8 +142,16 @@ def run_analytics_pipeline(
     messages = (
         f"Computed {len(index_results)} spectral indices.",
         f"Computed {len(change_results)} change detection products.",
-        f"Generated LULC outputs using {classification_method}.",
-        "Generated transition and change matrices.",
+        (
+            "Skipped LULC classification by configuration."
+            if classification_method == "none"
+            else f"Generated LULC outputs using {classification_method}."
+        ),
+        (
+            "Skipped transition and change matrices because LULC was disabled."
+            if classification_method == "none"
+            else "Generated transition and change matrices."
+        ),
         f"Created {len(accuracy)} accuracy assessments.",
     )
     report = AnalyticsReport(
@@ -143,10 +159,10 @@ def run_analytics_pipeline(
         messages=messages,
         index_results=index_results,
         change_results=change_results,
-        classification_results={
-            "lulc_t1": classification_t1,
-            "lulc_t2": classification_t2,
-        },
+        classification_results=_classification_results(
+            classification_t1,
+            classification_t2,
+        ),
         transition_result=transition_result,
         accuracy=accuracy,
         artifacts=artifacts,
@@ -196,26 +212,29 @@ def render_analytics_report(report: AnalyticsReport) -> str:
             f"changed={threshold_fraction:.2%}"
         )
     lines.extend(["", "## Classification", ""])
-    for name, classification_result in report.classification_results.items():
-        counts = ", ".join(
-            f"{class_name}={classification_result.counts[class_name]}"
-            for class_name in classification_result.class_names
+    if report.classification_results:
+        for name, classification_result in report.classification_results.items():
+            counts = ", ".join(
+                f"{class_name}={classification_result.counts[class_name]}"
+                for class_name in classification_result.class_names
+            )
+            lines.append(f"- {name}: {counts}")
+        lines.extend(["", "## Transition Matrix", ""])
+        lines.extend(
+            _render_matrix(
+                report.transition_result.transition_matrix,
+                report.transition_result.class_names,
+            )
         )
-        lines.append(f"- {name}: {counts}")
-    lines.extend(["", "## Transition Matrix", ""])
-    lines.extend(
-        _render_matrix(
-            report.transition_result.transition_matrix,
-            report.transition_result.class_names,
+        lines.extend(["", "## Change Matrix", ""])
+        lines.extend(
+            _render_matrix(
+                report.transition_result.change_matrix,
+                report.transition_result.class_names,
+            )
         )
-    )
-    lines.extend(["", "## Change Matrix", ""])
-    lines.extend(
-        _render_matrix(
-            report.transition_result.change_matrix,
-            report.transition_result.class_names,
-        )
-    )
+    else:
+        lines.append("- LULC classification was disabled for this run.")
     if report.accuracy:
         lines.extend(["", "## Accuracy Assessment", ""])
         for name, assessment in report.accuracy.items():
@@ -235,8 +254,8 @@ def _write_outputs(
     *,
     index_results: dict[str, SpectralIndexResult],
     change_results: dict[str, ChangeDetectionResult],
-    classification_t1: ClassificationResult,
-    classification_t2: ClassificationResult,
+    classification_t1: ClassificationResult | None,
+    classification_t2: ClassificationResult | None,
     transition_result: TransitionResult,
     accuracy: dict[str, AccuracyAssessment],
     indices_dir: Path,
@@ -333,40 +352,6 @@ def _write_outputs(
         ],
     )
 
-    t1_path = classification_dir / "lulc_t1.npy"
-    t2_path = classification_dir / "lulc_t2.npy"
-    transition_matrix_path = classification_dir / "transition_matrix.npy"
-    change_matrix_path = classification_dir / "change_matrix.npy"
-    np.save(t1_path, classification_t1.labels)
-    np.save(t2_path, classification_t2.labels)
-    np.save(transition_matrix_path, transition_result.transition_matrix)
-    np.save(change_matrix_path, transition_result.change_matrix)
-    lulc_t1_cog = _write_spatial_array(
-        _categorical_labels(classification_t1.labels),
-        grid,
-        classification_dir / "lulc_t1.tif",
-        band_name="lulc_t1",
-        nodata=255,
-    )
-    lulc_t2_cog = _write_spatial_array(
-        _categorical_labels(classification_t2.labels),
-        grid,
-        classification_dir / "lulc_t2.tif",
-        band_name="lulc_t2",
-        nodata=255,
-    )
-    transition_raster = _transition_labels(
-        classification_t1.labels,
-        classification_t2.labels,
-        len(transition_result.class_names),
-    )
-    transition_cog = _write_spatial_array(
-        transition_raster,
-        grid,
-        classification_dir / "transition_codes.tif",
-        band_name="lulc_transition_code",
-        nodata=255,
-    )
     signed_change_cog = _write_spatial_array(
         signed_change.labels,
         grid,
@@ -374,37 +359,60 @@ def _write_outputs(
         band_name="ndvi_loss_no_change_gain",
         nodata=255,
     )
-    artifacts.update(
-        {
-            "lulc_t1": t1_path,
-            "lulc_t2": t2_path,
-            "transition_matrix": transition_matrix_path,
-            "change_matrix": change_matrix_path,
-            "lulc_t1_cog": lulc_t1_cog,
-            "lulc_t2_cog": lulc_t2_cog,
-            "transition_codes_cog": transition_cog,
-            "ndvi_gain_loss_cog": signed_change_cog,
-        }
-    )
-    artifacts["classification_statistics"] = _write_json(
-        statistics_dir / "classification_statistics.json",
-        {
-            "lulc_t1": {
-                "method": classification_t1.method,
-                "model_name": classification_t1.model_name,
-                "counts": classification_t1.counts,
-                "feature_names": classification_t1.feature_names,
-                "metadata": classification_t1.metadata,
+    artifacts["ndvi_gain_loss_cog"] = signed_change_cog
+    if classification_t1 is not None and classification_t2 is not None:
+        t1_path = classification_dir / "lulc_t1.npy"
+        t2_path = classification_dir / "lulc_t2.npy"
+        transition_matrix_path = classification_dir / "transition_matrix.npy"
+        change_matrix_path = classification_dir / "change_matrix.npy"
+        np.save(t1_path, classification_t1.labels)
+        np.save(t2_path, classification_t2.labels)
+        np.save(transition_matrix_path, transition_result.transition_matrix)
+        np.save(change_matrix_path, transition_result.change_matrix)
+        lulc_t1_cog = _write_spatial_array(
+            _categorical_labels(classification_t1.labels),
+            grid,
+            classification_dir / "lulc_t1.tif",
+            band_name="lulc_t1",
+            nodata=255,
+        )
+        lulc_t2_cog = _write_spatial_array(
+            _categorical_labels(classification_t2.labels),
+            grid,
+            classification_dir / "lulc_t2.tif",
+            band_name="lulc_t2",
+            nodata=255,
+        )
+        transition_raster = _transition_labels(
+            classification_t1.labels,
+            classification_t2.labels,
+            len(transition_result.class_names),
+        )
+        transition_cog = _write_spatial_array(
+            transition_raster,
+            grid,
+            classification_dir / "transition_codes.tif",
+            band_name="lulc_transition_code",
+            nodata=255,
+        )
+        artifacts.update(
+            {
+                "lulc_t1": t1_path,
+                "lulc_t2": t2_path,
+                "transition_matrix": transition_matrix_path,
+                "change_matrix": change_matrix_path,
+                "lulc_t1_cog": lulc_t1_cog,
+                "lulc_t2_cog": lulc_t2_cog,
+                "transition_codes_cog": transition_cog,
+            }
+        )
+        artifacts["classification_statistics"] = _write_json(
+            statistics_dir / "classification_statistics.json",
+            {
+                "lulc_t1": _classification_payload(classification_t1),
+                "lulc_t2": _classification_payload(classification_t2),
             },
-            "lulc_t2": {
-                "method": classification_t2.method,
-                "model_name": classification_t2.model_name,
-                "counts": classification_t2.counts,
-                "feature_names": classification_t2.feature_names,
-                "metadata": classification_t2.metadata,
-            },
-        },
-    )
+        )
     if accuracy:
         artifacts["accuracy"] = _write_json(
             statistics_dir / "accuracy.json",
@@ -419,29 +427,67 @@ def _write_outputs(
             },
         )
 
-    transition_path = _write_json(
-        statistics_dir / "transition.json",
-        {
-            "class_names": transition_result.class_names,
-            "transition_matrix": transition_result.transition_matrix.tolist(),
-            "change_matrix": transition_result.change_matrix.tolist(),
-            "changed_pixels": transition_result.changed_pixels,
-        },
-    )
-    artifacts["transition_json"] = transition_path
     pixel_area_m2 = _pixel_area_square_metres(grid)
+    area_payload: dict[str, object] = {
+        "pixel_area_m2": pixel_area_m2,
+        "ndvi_change": _count_areas(signed_change.counts, pixel_area_m2),
+    }
+    if classification_t1 is not None and classification_t2 is not None:
+        transition_path = _write_json(
+            statistics_dir / "transition.json",
+            {
+                "class_names": transition_result.class_names,
+                "transition_matrix": transition_result.transition_matrix.tolist(),
+                "change_matrix": transition_result.change_matrix.tolist(),
+                "changed_pixels": transition_result.changed_pixels,
+            },
+        )
+        artifacts["transition_json"] = transition_path
+        area_payload["lulc_t1"] = _count_areas(
+            classification_t1.counts, pixel_area_m2
+        )
+        area_payload["lulc_t2"] = _count_areas(
+            classification_t2.counts, pixel_area_m2
+        )
     artifacts["area_statistics"] = _write_json(
         statistics_dir / "area_statistics.json",
-        {
-            "pixel_area_m2": pixel_area_m2,
-            "lulc_t1": _count_areas(classification_t1.counts, pixel_area_m2),
-            "lulc_t2": _count_areas(classification_t2.counts, pixel_area_m2),
-            "ndvi_change": _count_areas(signed_change.counts, pixel_area_m2),
-        },
+        area_payload,
     )
     report_path = reports_dir / "analytics_report.md"
     artifacts["analytics_report"] = report_path
     return artifacts
+
+
+def _classification_results(
+    classification_t1: ClassificationResult | None,
+    classification_t2: ClassificationResult | None,
+) -> dict[str, ClassificationResult]:
+    """Return the optional classification result mapping."""
+    if classification_t1 is None or classification_t2 is None:
+        return {}
+    return {"lulc_t1": classification_t1, "lulc_t2": classification_t2}
+
+
+def _empty_transition_result() -> TransitionResult:
+    """Return an empty transition result when LULC is disabled."""
+    empty = np.zeros((0, 0), dtype=np.int64)
+    return TransitionResult(
+        class_names=(),
+        transition_matrix=empty,
+        change_matrix=empty.copy(),
+        changed_pixels=0,
+    )
+
+
+def _classification_payload(result: ClassificationResult) -> dict[str, object]:
+    """Serialize a classification result for statistics JSON."""
+    return {
+        "method": result.method,
+        "model_name": result.model_name,
+        "counts": result.counts,
+        "feature_names": result.feature_names,
+        "metadata": result.metadata,
+    }
 
 
 def _build_signed_ndvi_change(
