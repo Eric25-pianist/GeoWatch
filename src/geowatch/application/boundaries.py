@@ -62,7 +62,31 @@ def search_boundaries(
     limit: int = 5,
 ) -> tuple[BoundaryCandidate, ...]:
     """Search OpenStreetMap for polygonal administrative candidates."""
-    query = ", ".join(value for value in (location, region, country) if value)
+    candidates: list[BoundaryCandidate] = []
+    seen_sources: set[str] = set()
+    queries = _boundary_queries(location, country, region)
+    for query in queries:
+        for candidate in _search_nominatim_query(query, location, limit=limit):
+            if candidate.source_url in seen_sources:
+                continue
+            seen_sources.add(candidate.source_url)
+            candidates.append(candidate)
+        if candidates:
+            return tuple(candidates[:limit])
+    attempted = "; ".join(queries)
+    raise GeoWatchError(
+        "No polygon boundary found. Tried: "
+        f"{attempted}. Try a district/division name or supply a local boundary file."
+    )
+
+
+def _search_nominatim_query(
+    query: str,
+    location: str,
+    *,
+    limit: int,
+) -> tuple[BoundaryCandidate, ...]:
+    """Search one Nominatim query and return polygonal candidates only."""
     params = urlencode(
         {
             "q": query,
@@ -105,11 +129,33 @@ def search_boundaries(
             area_sq_km=_area_sq_km(geometry),
         )
         candidates.append(candidate)
-    if not candidates:
-        raise GeoWatchError(
-            f"No polygon boundary found for {query}. Supply a local boundary file."
-        )
     return tuple(candidates)
+
+
+def _boundary_queries(
+    location: str,
+    country: str,
+    region: str | None,
+) -> tuple[str, ...]:
+    """Build forgiving administrative-boundary queries for common naming patterns."""
+    location = location.strip()
+    country = country.strip()
+    region = region.strip() if region else None
+    base = ", ".join(value for value in (location, region, country) if value)
+    names = (
+        location,
+        f"{location} District",
+        f"District {location}",
+        f"{location} Division",
+        f"{location} City",
+        f"{location} Metropolitan",
+    )
+    queries = [base]
+    for name in names:
+        query = ", ".join(value for value in (name, region, country) if value)
+        queries.append(query)
+    queries.append(", ".join(value for value in (location, country) if value))
+    return tuple(dict.fromkeys(query for query in queries if query))
 
 
 def candidate_from_file(path: Path, *, name: str) -> BoundaryCandidate:

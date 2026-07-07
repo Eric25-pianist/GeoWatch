@@ -10,6 +10,7 @@ from geowatch.application.boundaries import (
     BoundaryCandidate,
     render_boundary_preview,
     save_boundary_candidate,
+    search_boundaries,
     validate_candidate,
 )
 
@@ -63,3 +64,51 @@ def test_boundary_preview_handles_non_ascii_names(tmp_path: Path) -> None:
     preview = render_boundary_preview(candidate, tmp_path / "tokyo_preview.png")
 
     assert preview.exists()
+
+
+def test_boundary_search_retries_district_query_for_point_result(
+    monkeypatch: object,
+) -> None:
+    """Places whose city query is point-only should retry district-style names."""
+    calls: list[str] = []
+
+    def fake_get_json(url: str) -> object:
+        calls.append(url)
+        if "Lahore+District" not in url:
+            return [
+                {
+                    "name": "Lahore",
+                    "display_name": "Lahore, Punjab, Pakistan",
+                    "geojson": {"type": "Point", "coordinates": [74.35, 31.55]},
+                }
+            ]
+        return [
+            {
+                "name": "Lahore District",
+                "display_name": "Lahore District, Punjab, Pakistan",
+                "osm_type": "relation",
+                "osm_id": 123,
+                "geojson": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [
+                            [74.0, 31.0],
+                            [75.0, 31.0],
+                            [75.0, 32.0],
+                            [74.0, 32.0],
+                            [74.0, 31.0],
+                        ]
+                    ],
+                },
+                "address": {"country_code": "pk"},
+                "extratags": {"admin_level": "6"},
+            }
+        ]
+
+    monkeypatch.setattr("geowatch.application.boundaries._get_json", fake_get_json)
+
+    candidates = search_boundaries("Lahore", "Pakistan", "Punjab")
+
+    assert len(candidates) == 1
+    assert candidates[0].name == "Lahore District"
+    assert any("Lahore+District" in call for call in calls)
