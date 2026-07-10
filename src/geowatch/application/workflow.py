@@ -15,6 +15,7 @@ from geowatch.acquisition.models import AcquisitionConfig, DatasetName, SceneMet
 from geowatch.acquisition.pipeline import run_acquisition
 from geowatch.analytics.pipeline import run_analytics_pipeline
 from geowatch.application.availability import (
+    AVAILABILITY_PLANNER_VERSION,
     AvailabilityPlan,
     build_availability_plan,
 )
@@ -164,15 +165,70 @@ def preflight_project(project_file: Path, *, force: bool = False) -> Availabilit
 
 def project_status(project_file: Path) -> str:
     """Render a human-readable status table for one project."""
+    spec = load_run_specification(project_file)
     layout = ProjectLayout(project_file.parent)
     manifest = load_or_create_manifest(layout.manifest, project_file)
+    profile = select_common_sensor(
+        spec.temporal.start_year,
+        spec.temporal.end_year,
+        spec.imagery.sensor,
+    )
+    availability = _status_availability(layout, spec, profile)
     lines = [f"GeoWatch project: {layout.root}"]
     if not manifest.stages:
         lines.append("- No stages have run.")
     for name, record in manifest.stages.items():
         suffix = f" - {record.message}" if record.message else ""
-        lines.append(f"- {name}: {record.status}{suffix}")
+        status = _display_stage_status(
+            name,
+            record.status,
+            layout,
+            profile,
+            availability,
+        )
+        lines.append(f"- {name}: {status}{suffix}")
     return "\n".join(lines)
+
+
+def _status_availability(
+    layout: ProjectLayout,
+    spec: RunSpecification,
+    profile: SensorProfile,
+) -> AvailabilityPlan | None:
+    """Load a status-only availability plan when it is compatible."""
+    path = layout.root / "availability_plan.json"
+    if not path.exists():
+        return None
+    try:
+        plan = _load_cached_availability(path)
+    except GeoWatchError:
+        return None
+    return plan if _availability_matches_spec(plan, spec, profile) else None
+
+
+def _display_stage_status(
+    name: str,
+    status: str,
+    layout: ProjectLayout,
+    profile: SensorProfile,
+    availability: AvailabilityPlan | None,
+) -> str:
+    """Annotate completed acquisition stages whose local cache is incomplete."""
+    if status != "completed" or not name.startswith("acquisition:"):
+        return status
+    try:
+        year = int(name.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        return status
+    selected = (
+        availability.years[year].scene_ids
+        if availability is not None and year in availability.years
+        else ()
+    )
+    catalog = layout.root / "raw" / str(year) / "acquisition_catalog.json"
+    if _catalog_has_complete_downloads(catalog, profile, selected):
+        return status
+    return "completed (incomplete cache; resume will reacquire)"
 
 
 def _acquire_year(
@@ -397,7 +453,11 @@ def _year_config(
     final_day = calendar.monthrange(year, end_month)[1]
     raw = layout.root / "raw" / str(year)
     output = layout.root
-    provider = spec.imagery.provider
+    provider = (
+        availability.effective_provider
+        if availability is not None
+        else spec.imagery.provider
+    )
     selected_scene_count = (
         availability.years[year].scene_count
         if availability is not None
@@ -424,6 +484,9 @@ def _year_config(
             download_directory=raw / "assets",
             metadata_catalog=raw / "acquisition_catalog.json",
             acquisition_report=layout.root / "reports" / f"acquisition_{year}.md",
+            request_timeout_seconds=90.0,
+            retry_attempts=5,
+            retry_backoff_seconds=2.0,
             max_download_bytes=8_589_934_592,
             selected_scene_ids=(
                 availability.years[year].scene_ids if availability is not None else ()
@@ -535,6 +598,10 @@ def _availability_matches_spec(
 ) -> bool:
     """Return whether a cached availability plan still matches the run spec."""
     return (
+        plan.planner_version == AVAILABILITY_PLANNER_VERSION
+        and
+        plan.requested_provider == spec.imagery.provider
+        and
         plan.dataset == profile.dataset
         and plan.requested_start_month == spec.temporal.start_month
         and plan.requested_end_month == spec.temporal.end_month
@@ -557,13 +624,22 @@ def _validate_acquisition_result(
         raise GeoWatchError(f"{year} acquisition did not select any scenes.")
     missing_scenes = [scene_id for scene_id in expected if scene_id not in grouped]
     if missing_scenes:
+        logger.warning(
+            "{} acquisition skipped {} selected scene(s) after download failures: {}. "
+            "Composite generation will validate whether the remaining complete "
+            "scenes provide enough AOI coverage.",
+            year,
+            len(missing_scenes),
+            ", ".join(missing_scenes[:5]),
+        )
+    complete_candidates = [scene_id for scene_id in expected if scene_id in grouped]
+    if not complete_candidates:
         raise GeoWatchError(
-            f"{year} acquisition missed selected scene(s): "
-            + ", ".join(missing_scenes)
+            f"{year} acquisition did not download any complete selected scenes."
         )
     incomplete = [
         scene_id
-        for scene_id in expected
+        for scene_id in complete_candidates
         if not _download_group_has_required_assets(grouped[scene_id], profile)
     ]
     if incomplete:

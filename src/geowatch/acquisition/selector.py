@@ -53,9 +53,9 @@ def rank_scenes(
             matching,
             key=lambda scene: (
                 -scene_aoi_coverage(scene, aoi_bbox),
+                _date_distance(scene.acquired_at, temporal_midpoint),
                 scene.cloud_cover is None,
                 scene.cloud_cover if scene.cloud_cover is not None else 101.0,
-                _date_distance(scene.acquired_at, temporal_midpoint),
                 scene.scene_id,
             ),
         )

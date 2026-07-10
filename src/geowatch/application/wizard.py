@@ -12,6 +12,8 @@ from loguru import logger
 
 from geowatch.application.boundaries import (
     BoundaryCandidate,
+    BoundarySearchKind,
+    boundary_warning_messages,
     candidate_from_file,
     render_boundary_preview,
     save_boundary_candidate,
@@ -20,10 +22,14 @@ from geowatch.application.boundaries import (
 )
 from geowatch.application.models import (
     AnalysisSpec,
+    ClassificationMethod,
     ImagerySpec,
     LocationSpec,
     OutputSpec,
+    ProviderPreference,
     RunSpecification,
+    SensorPreference,
+    TemporalMode,
     TemporalSpec,
 )
 from geowatch.application.project import ProjectLayout, write_run_specification
@@ -39,6 +45,14 @@ SEASONS: dict[str, tuple[int, int]] = {
     "monsoon": (7, 9),
     "custom": (1, 12),
 }
+
+BOUNDARY_KIND_CHOICES: tuple[tuple[BoundarySearchKind, str], ...] = (
+    ("city", "City / municipality (recommended for most city projects)"),
+    ("urban", "Urban core / special wards"),
+    ("district", "District / county / division"),
+    ("state", "State / province / prefecture"),
+    ("auto", "Auto / broad search"),
+)
 
 
 def run_interactive_wizard(
@@ -71,11 +85,18 @@ def run_interactive_wizard(
     local_path_text = typer.prompt(
         "Local boundary file (leave blank to search online)", default=""
     ).strip()
+    boundary_kind: BoundarySearchKind = "auto"
     if local_path_text:
         candidate = candidate_from_file(Path(local_path_text), name=location)
     else:
-        candidates = search_boundaries(location, country, region)
-        candidate = _choose_candidate(candidates)
+        boundary_kind = _prompt_boundary_kind()
+        candidates = search_boundaries(
+            location,
+            country,
+            region,
+            boundary_kind=boundary_kind,
+        )
+        candidate = _choose_candidate(candidates, boundary_kind=boundary_kind)
 
     provisional = RunSpecification(
         location=LocationSpec(name=location, country=country, region=region),
@@ -93,8 +114,9 @@ def run_interactive_wizard(
         candidate, layout.root / "boundary" / "preview" / "boundary_preview.png"
     )
     findings = validate_candidate(candidate)
-    _show_boundary(candidate, preview, findings)
-    if not typer.confirm("Use this administrative boundary?", default=True):
+    warnings = boundary_warning_messages(candidate, requested_kind=boundary_kind)
+    _show_boundary(candidate, preview, findings, warnings)
+    if not typer.confirm("Use this administrative boundary?", default=not warnings):
         raise GeoWatchError(
             "Boundary was not approved. Run the wizard again or supply a local file."
         )
@@ -116,12 +138,14 @@ def run_interactive_wizard(
         source_path=layout.root / "boundary" / "source" / "boundary.geojson",
         validated_path=layout.root / "boundary" / "validated" / "boundary.geojson",
         metadata_path=layout.root / "boundary" / "validated" / "provenance.json",
+        requested_kind=boundary_kind,
     )
     spec = RunSpecification(
         location=LocationSpec(
             name=location,
             country=country,
             region=region,
+            boundary_kind=boundary_kind,
             administrative_level=candidate.administrative_level,
             boundary_path=validated.resolve(),
             boundary_source=candidate.source,
@@ -152,14 +176,25 @@ def run_interactive_wizard(
     return spec, layout
 
 
-def _choose_candidate(candidates: tuple[BoundaryCandidate, ...]) -> BoundaryCandidate:
+def _choose_candidate(
+    candidates: tuple[BoundaryCandidate, ...],
+    *,
+    boundary_kind: BoundarySearchKind,
+) -> BoundaryCandidate:
     typer.echo("\nBoundary candidates:")
     for index, candidate in enumerate(candidates, start=1):
+        lon_span, lat_span = candidate.bbox_span_degrees
         typer.echo(
             f"  {index}. {_terminal_text(candidate.display_name)} | "
             f"admin={candidate.administrative_level or 'n/a'} "
-            f"| area={candidate.area_sq_km:,.1f} km2"
+            f"| area={candidate.area_sq_km:,.1f} km2 "
+            f"| parts={candidate.part_count} "
+            f"| span={lon_span:.1f}x{lat_span:.1f} deg"
         )
+        for warning in boundary_warning_messages(
+            candidate, requested_kind=boundary_kind
+        )[:2]:
+            typer.echo(f"     Warning: {warning}")
     selection = cast(int, typer.prompt("Choose boundary number", default=1, type=int))
     if not 1 <= selection <= len(candidates):
         raise GeoWatchError("Boundary selection is outside the candidate list.")
@@ -170,6 +205,7 @@ def _show_boundary(
     candidate: BoundaryCandidate,
     preview: Path,
     findings: tuple[str, ...],
+    warnings: tuple[str, ...],
 ) -> None:
     typer.echo("\nProposed administrative boundary")
     typer.echo(f"  Name: {_terminal_text(candidate.display_name)}")
@@ -180,6 +216,19 @@ def _show_boundary(
     typer.echo(f"  Preview: {preview.resolve()}")
     for finding in findings:
         typer.echo(f"  Check: {finding}")
+    for warning in warnings:
+        typer.echo(f"  Warning: {warning}")
+
+
+def _prompt_boundary_kind() -> BoundarySearchKind:
+    """Ask what administrative level the user intends to map."""
+    typer.echo("\nWhat boundary do you want GeoWatch to use?")
+    for index, (_kind, label) in enumerate(BOUNDARY_KIND_CHOICES, start=1):
+        typer.echo(f"{index}. {label}")
+    choice = typer.prompt("Boundary type number", default=1, type=int)
+    if not 1 <= choice <= len(BOUNDARY_KIND_CHOICES):
+        raise GeoWatchError("Boundary type selection is outside the supported list.")
+    return cast(BoundarySearchKind, BOUNDARY_KIND_CHOICES[choice - 1][0])
 
 
 def _advanced_settings(
@@ -188,14 +237,58 @@ def _advanced_settings(
     temporal: TemporalSpec,
     outputs: OutputSpec,
 ) -> tuple[ImagerySpec, AnalysisSpec, TemporalSpec, OutputSpec]:
-    mode = typer.prompt("Time mode [endpoints/annual/interval]", default=temporal.mode)
+    mode = cast(
+        TemporalMode,
+        _normalize_choice(
+            typer.prompt(
+                "Time mode [endpoints/annual/interval]", default=temporal.mode
+            ),
+            {
+                "endpoints": "endpoints",
+                "endpoint": "endpoints",
+                "annual": "annual",
+                "yearly": "annual",
+                "interval": "interval",
+            },
+            "time mode",
+        ),
+    )
     interval = temporal.interval_years
     if mode == "interval":
         interval = typer.prompt("Interval in years", default=2, type=int)
-    sensor = typer.prompt("Sensor [auto/landsat/sentinel-2]", default=imagery.sensor)
-    provider = typer.prompt(
-        "Provider [auto/planetary-computer/usgs/copernicus]",
-        default=imagery.provider,
+    sensor = cast(
+        SensorPreference,
+        _normalize_choice(
+            typer.prompt("Sensor [auto/landsat/sentinel-2]", default=imagery.sensor),
+            {
+                "auto": "auto",
+                "landsat": "landsat",
+                "sentinel-2": "sentinel-2",
+                "sentinel_2": "sentinel-2",
+                "sentinel2": "sentinel-2",
+                "sentinel": "sentinel-2",
+            },
+            "sensor",
+        ),
+    )
+    provider = cast(
+        ProviderPreference,
+        _normalize_choice(
+            typer.prompt(
+                "Provider [auto/planetary-computer/usgs/copernicus]",
+                default=imagery.provider,
+            ),
+            {
+                "auto": "auto",
+                "planetary-computer": "planetary-computer",
+                "planetary_computer": "planetary-computer",
+                "planetarycomputer": "planetary-computer",
+                "microsoft": "planetary-computer",
+                "usgs": "usgs",
+                "copernicus": "copernicus",
+            },
+            "provider",
+        ),
     )
     cloud = typer.prompt(
         "Maximum cloud cover percent", default=imagery.max_cloud_cover, type=float
@@ -205,9 +298,27 @@ def _advanced_settings(
         default=imagery.max_scenes_per_year,
         type=int,
     )
-    classification = typer.prompt(
-        "LULC [kmeans/isodata/random_forest/xgboost/svm]",
-        default=analysis.classification,
+    classification = cast(
+        ClassificationMethod,
+        _normalize_choice(
+            typer.prompt(
+                "LULC [kmeans/isodata/random_forest/xgboost/svm]",
+                default=analysis.classification,
+            ),
+            {
+                "kmeans": "kmeans",
+                "k_means": "kmeans",
+                "k-means": "kmeans",
+                "isodata": "isodata",
+                "random_forest": "random_forest",
+                "random-forest": "random_forest",
+                "randomforest": "random_forest",
+                "xgboost": "xgboost",
+                "xgb": "xgboost",
+                "svm": "svm",
+            },
+            "LULC method",
+        ),
     )
     training_text = ""
     if classification in {"random_forest", "xgboost", "svm"}:
@@ -249,6 +360,20 @@ def _advanced_settings(
         temporal.model_copy(update={"mode": mode, "interval_years": interval}),
         outputs.model_copy(update={"max_workers": workers}),
     )
+
+
+def _normalize_choice(
+    value: str,
+    aliases: dict[str, str],
+    label: str,
+) -> str:
+    """Normalize a free-text menu choice and fail before writing bad YAML."""
+    normalized = value.strip().lower().replace(" ", "_")
+    normalized = normalized.replace("__", "_")
+    if normalized in aliases:
+        return aliases[normalized]
+    allowed = ", ".join(sorted(set(aliases.values())))
+    raise GeoWatchError(f"Unsupported {label}: {value}. Choose one of: {allowed}.")
 
 
 def _prompt_map_theme(*, default: MapThemeName) -> MapThemeName:

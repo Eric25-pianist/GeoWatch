@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Annotated
 
@@ -34,7 +35,8 @@ from geowatch.validation.quality_score import load_quality_report
 app = typer.Typer(
     name="geowatch",
     help="Professional terminal GIS and satellite change-detection application.",
-    no_args_is_help=True,
+    invoke_without_command=True,
+    no_args_is_help=False,
 )
 
 DEFAULT_CONFIG_PATH = Path("configs/default.yaml")
@@ -70,6 +72,38 @@ LahoreOutputOption = Annotated[
     Path | None,
     typer.Option("--output-root", help="Override the Lahore QC output root."),
 ]
+
+_WELCOME_BANNER = (
+    "  ██████╗ ███████╗ ██████╗ ██╗    ██╗ █████╗ ████████╗ ██████╗██╗  ██╗",
+    " ██╔════╝ ██╔════╝██╔═══██╗██║    ██║██╔══██╗╚══██╔══╝██╔════╝██║  ██║",
+    " ██║  ███╗█████╗  ██║   ██║██║ █╗ ██║███████║   ██║   ██║     ███████║",
+    " ██║   ██║██╔══╝  ██║   ██║██║███╗██║██╔══██║   ██║   ██║     ██╔══██║",
+    " ╚██████╔╝███████╗╚██████╔╝╚███╔███╔╝██║  ██║   ██║   ╚██████╗██║  ██║",
+    "  ╚═════╝ ╚══════╝ ╚═════╝  ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝",
+)
+_WELCOME_BANNER_COLORS = (
+    (255, 150, 83),
+    (255, 128, 79),
+    (255, 105, 72),
+    (239, 88, 82),
+    (214, 82, 108),
+    (141, 83, 135),
+)
+_WELCOME_FLOW = (
+    ("Boundary", "confirm the real administrative shape"),
+    ("Imagery", "find cloud-aware Sentinel/Landsat scenes"),
+    ("Analysis", "build indices, LULC, and change products"),
+    ("Publish", "export maps, dashboard, reports, and portfolio"),
+)
+
+
+@app.callback(invoke_without_command=True)
+def root_command(ctx: typer.Context) -> None:
+    """Launch the guided GeoWatch workflow when no subcommand is supplied."""
+    if ctx.invoked_subcommand is not None:
+        return
+    _print_welcome()
+    _run_wizard(output_root=Path("outputs"), setup_only=False)
 
 
 @app.command("init")
@@ -257,6 +291,12 @@ def wizard_command(
     ] = False,
 ) -> None:
     """Create and optionally run a professional GIS project interactively."""
+    _print_welcome()
+    _run_wizard(output_root=output_root, setup_only=setup_only)
+
+
+def _run_wizard(output_root: Path, setup_only: bool) -> None:
+    """Run the interactive project wizard and optional processing pipeline."""
     try:
         spec, layout = run_interactive_wizard(output_root=output_root)
         typer.echo(f"Project specification: {layout.specification}")
@@ -291,7 +331,10 @@ def process_command(
     try:
         result = process_project(project_file, resume=False, map_theme=map_theme)
     except (GeoWatchError, ValueError) as exc:
-        typer.echo(f"Processing failed: {exc}", err=True)
+        typer.echo(
+            f"Processing failed: {_friendly_provider_failure('auto', exc)}",
+            err=True,
+        )
         raise typer.Exit(code=1) from exc
     typer.echo(f"Completed project: {result}")
     _echo_quality_summary(result)
@@ -306,7 +349,10 @@ def resume_command(
     try:
         result = process_project(project_file, resume=True, map_theme=map_theme)
     except (GeoWatchError, ValueError) as exc:
-        typer.echo(f"Resume failed: {exc}", err=True)
+        typer.echo(
+            f"Resume failed: {_friendly_provider_failure('auto', exc)}",
+            err=True,
+        )
         raise typer.Exit(code=1) from exc
     typer.echo(f"Completed project: {result}")
     _echo_quality_summary(result)
@@ -335,6 +381,54 @@ def quality_command(project_file: ProjectFileArgument) -> None:
         typer.echo(f"Quality summary failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(report.format_terminal())
+
+
+def _print_welcome() -> None:
+    """Render the polished default terminal welcome screen."""
+    typer.echo()
+    _print_wordmark()
+    typer.secho(
+        "  GEOWATCH  /  satellite change detection from the terminal",
+        fg=typer.colors.WHITE,
+        bold=True,
+    )
+    typer.secho(
+        "  Real boundaries, real imagery, professional maps and dashboards.",
+        fg=typer.colors.BRIGHT_BLACK,
+        bold=True,
+    )
+    typer.echo()
+    _print_tips()
+
+
+def _print_wordmark() -> None:
+    """Print the GEOWATCH wordmark with a warm terminal gradient."""
+    for line, color in zip(_WELCOME_BANNER, _WELCOME_BANNER_COLORS, strict=True):
+        typer.echo(_terminal_rgb(line, color, bold=True))
+
+
+def _print_tips() -> None:
+    """Print a concise Claude-style getting-started section."""
+    typer.secho("  Tips for getting started:", fg=typer.colors.BRIGHT_BLACK, bold=True)
+    for index, (label, description) in enumerate(_WELCOME_FLOW, start=1):
+        typer.secho(f"  {index}. {label:<9}", fg=typer.colors.YELLOW, nl=False)
+        typer.echo(f" {description}")
+    typer.echo("  5. Resume     geowatch resume outputs\\<Location>\\project.yaml")
+    typer.echo()
+
+
+def _terminal_rgb(
+    text: str,
+    color: tuple[int, int, int],
+    *,
+    bold: bool = False,
+) -> str:
+    """Return text wrapped in ANSI true-color escape codes when allowed."""
+    if os.environ.get("NO_COLOR"):
+        return text
+    weight = "1;" if bold else ""
+    red, green, blue = color
+    return f"\033[{weight}38;2;{red};{green};{blue}m{text}\033[0m"
 
 
 def main() -> None:
@@ -384,5 +478,27 @@ def _friendly_provider_failure(provider: str, exc: Exception) -> str:
             "USGS imagery search did not respond in time. Your project setup is "
             "fine, but the provider or network timed out. Try the wizard again "
             "with Provider set to auto or planetary-computer, or retry USGS later."
+        )
+    if (
+        "could not resolve the imagery provider host" in lowered
+        or "getaddrinfo failed" in lowered
+        or "temporary failure in name resolution" in lowered
+        or "name or service not known" in lowered
+    ):
+        return (
+            "GeoWatch could not reach the satellite imagery provider because DNS or "
+            "internet access failed. Your project setup is OK. Check Wi-Fi/internet, "
+            "disable or change VPN/firewall settings if needed, then run "
+            "`geowatch resume <project.yaml>`."
+        )
+    if (
+        "timed out" in lowered
+        or "connection reset" in lowered
+        or "connection aborted" in lowered
+    ):
+        return (
+            "The imagery provider or network timed out. Your project setup is OK. "
+            "Try again with `geowatch resume <project.yaml>`, or choose a different "
+            "provider in Advanced settings."
         )
     return message

@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import importlib.util
-from collections.abc import Mapping, Sequence
+import warnings
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any, cast
 
 import numpy as np
 from loguru import logger
 from numpy.typing import NDArray
 from scipy.optimize import linear_sum_assignment
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import cohen_kappa_score, confusion_matrix
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
+from threadpoolctl import threadpool_limits  # type: ignore[import-untyped]
 
 from geowatch.analytics.errors import ClassificationError
 from geowatch.analytics.indices import compute_scene_indices, extract_canonical_bands
@@ -104,6 +107,8 @@ DEFAULT_LULC_METHODS: tuple[str, ...] = (
     "xgboost",
     "svm",
 )
+MAX_CLUSTER_TRAINING_PIXELS = 200_000
+CLASSIFICATION_CHUNK_PIXELS = 500_000
 
 
 def classify_lulc(
@@ -115,24 +120,29 @@ def classify_lulc(
     random_state: int = 42,
 ) -> ClassificationResult:
     """Classify a scene using one of the supported LULC methods."""
-    feature_matrix, valid_mask, feature_names, shape = _build_feature_stack(
+    feature_sources, valid_grid, feature_names, shape = _build_feature_sources(
         scene,
         index_maps=index_maps,
     )
+    valid_mask = valid_grid.reshape(-1)
+    valid_indices = np.flatnonzero(valid_mask)
+    if valid_indices.size == 0:
+        message = "LULC classification requires at least one valid feature pixel."
+        logger.error(message)
+        raise ClassificationError(message)
     method_name = method.lower()
-    scaled_features, scaler = _scale_features(feature_matrix)
     if method_name == "kmeans":
         labels, model_name = _classify_unsupervised(
-            scaled_features,
-            scaler,
+            feature_sources,
+            valid_indices,
             feature_names,
             cluster_strategy="kmeans",
             random_state=random_state,
         )
     elif method_name == "isodata":
         labels, model_name = _classify_unsupervised(
-            scaled_features,
-            scaler,
+            feature_sources,
+            valid_indices,
             feature_names,
             cluster_strategy="isodata",
             random_state=random_state,
@@ -142,6 +152,8 @@ def classify_lulc(
             message = f"{method_name} classification requires training labels."
             logger.error(message)
             raise ClassificationError(message)
+        feature_matrix = _feature_rows(feature_sources, valid_indices)
+        scaled_features, _scaler = _scale_features(feature_matrix)
         labels, model_name = _classify_supervised(
             scaled_features,
             valid_mask,
@@ -156,7 +168,7 @@ def classify_lulc(
         raise ClassificationError(message)
 
     classification_map = np.full(valid_mask.size, -1, dtype=np.int64)
-    classification_map[valid_mask] = labels
+    classification_map[valid_indices] = labels
     label_grid = classification_map.reshape(shape)
     counts = _count_labels(label_grid, ANALYTICS_CLASS_NAMES)
     logger.info("Classified scene {} with method {}", scene.name, method_name)
@@ -250,12 +262,17 @@ def assess_accuracy(
     )
 
 
-def _build_feature_stack(
+def _build_feature_sources(
     scene: RasterLayer,
     *,
     index_maps: Mapping[str, NDArray[np.float32]] | None = None,
-) -> tuple[NDArray[np.float32], NDArray[np.bool_], tuple[str, ...], tuple[int, int]]:
-    """Construct a feature matrix for LULC classification."""
+) -> tuple[
+    tuple[NDArray[np.float32], ...],
+    NDArray[np.bool_],
+    tuple[str, ...],
+    tuple[int, int],
+]:
+    """Construct feature sources for LULC classification without stacking copies."""
     bands = extract_canonical_bands(scene)
     index_bundle = dict(index_maps or compute_scene_indices(scene))
     feature_names = (
@@ -267,8 +284,9 @@ def _build_feature_stack(
         "swir2",
         *index_bundle.keys(),
     )
-    feature_stack = np.stack(
-        [
+    feature_sources = tuple(
+        np.asarray(source, dtype=np.float32)
+        for source in (
             bands["blue"],
             bands["green"],
             bands["red"],
@@ -276,17 +294,23 @@ def _build_feature_stack(
             bands["swir1"],
             bands["swir2"],
             *[index_bundle[name] for name in index_bundle],
-        ],
-        axis=0,
-    ).astype(np.float32, copy=False)
-    valid_mask = np.all(np.isfinite(feature_stack), axis=0)
-    feature_matrix = feature_stack.reshape(feature_stack.shape[0], -1).T
-    return (
-        feature_matrix[valid_mask.reshape(-1)],
-        valid_mask.reshape(-1),
-        tuple(feature_names),
-        (scene.grid.height, scene.grid.width),
+        )
     )
+    valid_mask = np.ones((scene.grid.height, scene.grid.width), dtype=bool)
+    for source in feature_sources:
+        valid_mask &= np.isfinite(source)
+    return feature_sources, valid_mask, tuple(feature_names), valid_mask.shape
+
+
+def _feature_rows(
+    feature_sources: Sequence[NDArray[np.float32]],
+    flat_indices: NDArray[np.int64],
+) -> NDArray[np.float32]:
+    """Extract selected flat pixel rows from feature source arrays."""
+    rows = np.empty((flat_indices.size, len(feature_sources)), dtype=np.float32)
+    for feature_index, source in enumerate(feature_sources):
+        rows[:, feature_index] = source.reshape(-1)[flat_indices]
+    return rows
 
 
 def _scale_features(
@@ -299,20 +323,32 @@ def _scale_features(
 
 
 def _classify_unsupervised(
-    features: NDArray[np.float32],
-    scaler: StandardScaler,
+    feature_sources: Sequence[NDArray[np.float32]],
+    valid_indices: NDArray[np.int64],
     feature_names: tuple[str, ...],
     *,
     cluster_strategy: str,
     random_state: int,
 ) -> tuple[NDArray[np.int64], str]:
     """Classify a feature stack using an unsupervised clustering strategy."""
+    sample_indices = _sample_valid_indices(valid_indices, random_state=random_state)
+    sample_features = _feature_rows(feature_sources, sample_indices)
+    scaler = StandardScaler()
+    scaled_sample = scaler.fit_transform(sample_features).astype(
+        np.float32,
+        copy=False,
+    )
     if cluster_strategy == "kmeans":
-        labels, centers = _run_kmeans(features, random_state=random_state)
-        model_name = "kmeans"
+        model = _fit_minibatch_kmeans(scaled_sample, random_state=random_state)
+        centers = model.cluster_centers_.astype(np.float32, copy=False)
+        model_name = "kmeans_minibatch"
     elif cluster_strategy == "isodata":
-        labels, centers = _run_isodata(features, random_state=random_state)
-        model_name = "isodata"
+        _sample_labels, centers = _run_isodata(
+            scaled_sample,
+            random_state=random_state,
+        )
+        model = None
+        model_name = "isodata_sampled"
     else:
         raise ClassificationError(
             f"Unsupported unsupervised strategy: {cluster_strategy}"
@@ -320,11 +356,79 @@ def _classify_unsupervised(
     prototype_matrix = _prototype_matrix(feature_names)
     scaled_prototypes = scaler.transform(prototype_matrix)
     cluster_to_class = _map_clusters_to_classes(centers, scaled_prototypes)
-    mapped = np.asarray(
-        [cluster_to_class[int(label)] for label in labels],
+    mapped_lookup = np.asarray(
+        [cluster_to_class[index] for index in range(centers.shape[0])],
         dtype=np.int64,
     )
+    mapped = np.empty(valid_indices.size, dtype=np.int64)
+    for start in range(0, valid_indices.size, CLASSIFICATION_CHUNK_PIXELS):
+        end = min(start + CLASSIFICATION_CHUNK_PIXELS, valid_indices.size)
+        rows = _feature_rows(feature_sources, valid_indices[start:end])
+        scaled_rows = scaler.transform(rows).astype(np.float32, copy=False)
+        if model is not None:
+            cluster_labels = cast(
+                NDArray[np.int64],
+                np.asarray(model.predict(scaled_rows), dtype=np.int64),
+            )
+        else:
+            cluster_labels = _nearest_center_labels(scaled_rows, centers)
+        mapped[start:end] = mapped_lookup[cluster_labels]
+    logger.debug(
+        "Mapped {} valid pixels using {} sampled training pixels.",
+        valid_indices.size,
+        sample_indices.size,
+    )
     return mapped, model_name
+
+
+def _sample_valid_indices(
+    valid_indices: NDArray[np.int64],
+    *,
+    random_state: int,
+) -> NDArray[np.int64]:
+    """Return a deterministic valid-pixel training sample for clustering."""
+    if valid_indices.size <= MAX_CLUSTER_TRAINING_PIXELS:
+        return valid_indices
+    generator = np.random.default_rng(random_state)
+    positions = generator.choice(
+        valid_indices.size,
+        size=MAX_CLUSTER_TRAINING_PIXELS,
+        replace=False,
+    )
+    return np.sort(valid_indices[positions]).astype(np.int64, copy=False)
+
+
+def _fit_minibatch_kmeans(
+    features: NDArray[np.float32],
+    *,
+    random_state: int,
+) -> MiniBatchKMeans:
+    """Fit a memory-bounded K-Means model to sampled feature rows."""
+    cluster_count = min(len(ANALYTICS_CLASS_NAMES), features.shape[0])
+    if cluster_count < 1:
+        raise ClassificationError("K-Means requires at least one valid sample.")
+    model = MiniBatchKMeans(
+        n_clusters=cluster_count,
+        random_state=random_state,
+        n_init=5,
+        batch_size=min(8192, max(cluster_count * 32, 1024)),
+        reassignment_ratio=0.01,
+    )
+    with _limited_openmp_threads():
+        model.fit(features)
+    return model
+
+
+def _nearest_center_labels(
+    features: NDArray[np.float32],
+    centers: NDArray[np.float32],
+) -> NDArray[np.int64]:
+    """Assign feature rows to the nearest sampled cluster center."""
+    distances = np.linalg.norm(
+        features[:, None, :] - centers[None, :, :],
+        axis=2,
+    )
+    return cast(NDArray[np.int64], np.argmin(distances, axis=1).astype(np.int64))
 
 
 def _classify_supervised(
@@ -380,12 +484,7 @@ def _run_kmeans(
     random_state: int,
 ) -> tuple[NDArray[np.int64], NDArray[np.float32]]:
     """Fit KMeans using the canonical land-cover class count."""
-    cluster_count = min(len(ANALYTICS_CLASS_NAMES), features.shape[0])
-    model = KMeans(
-        n_clusters=cluster_count,
-        random_state=random_state,
-        n_init=10,
-    )
+    model = _fit_minibatch_kmeans(features, random_state=random_state)
     labels = model.fit_predict(features)
     return labels.astype(np.int64, copy=False), model.cluster_centers_.astype(
         np.float32,
@@ -433,9 +532,28 @@ def _run_isodata(
             n_init=1,
             random_state=random_state,
         )
-        labels = model.fit_predict(features)
+        with _limited_openmp_threads():
+            labels = model.fit_predict(features)
         current_centers = model.cluster_centers_.astype(np.float32, copy=False)
     return labels.astype(np.int64, copy=False), current_centers
+
+
+@contextmanager
+def _limited_openmp_threads() -> Iterator[None]:
+    """Limit OpenMP clustering threads while hiding known runtime noise."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="(?s).*Found Intel OpenMP.*",
+            category=RuntimeWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            category=RuntimeWarning,
+            module="threadpoolctl",
+        )
+        with threadpool_limits(limits=1, user_api="openmp"):
+            yield
 
 
 def _merge_centers(

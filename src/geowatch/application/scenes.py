@@ -7,6 +7,7 @@ import json
 import math
 import warnings
 from collections import defaultdict
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from geowatch.utils.geometry import (
 
 CANONICAL_BANDS = ("blue", "green", "red", "nir", "swir1", "swir2")
 DEFAULT_MAX_PIXELS = 12_000_000
+COMPOSITE_CHUNK_SIZE = 512
 
 
 def build_year_composite(
@@ -87,18 +89,15 @@ def build_year_composite(
         len(complete),
     )
     scenes = [_warp_scene(assets, profile, grid, projected) for assets in complete]
-    stack = np.stack([scene.data for scene in scenes], axis=0)
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
-        warnings.filterwarnings("ignore", message="Mean of empty slice")
-        if method == "mean":
-            data = np.nanmean(stack, axis=0)
-        elif method == "first":
-            data = stack[0]
-            for candidate in stack[1:]:
-                data = np.where(np.isfinite(data), data, candidate)
-        else:
-            data = np.nanmedian(stack, axis=0)
+    try:
+        data = _combine_scene_data(scenes, method=method)
+    except MemoryError as exc:
+        raise GeoWatchError(
+            f"{year} composite exceeded available memory while combining scenes. "
+            "GeoWatch now uses chunked compositing, so this usually means the AOI is "
+            "too large for the current laptop settings. Use a smaller boundary or "
+            "lower the output resolution."
+        ) from exc
     invalid = ~np.any(np.isfinite(data), axis=0)
     inside = geometry_mask_for_grid(projected, grid)
     inside_pixels = int(inside.sum())
@@ -155,6 +154,112 @@ def build_year_composite(
     )
     written = write_raster(result, output_path, driver="COG")
     result.metadata["output_path"] = str(written)
+    return result
+
+
+def _combine_scene_data(
+    scenes: list[RasterLayer],
+    *,
+    method: str,
+    chunk_size: int = COMPOSITE_CHUNK_SIZE,
+) -> np.ndarray:
+    """Combine warped scenes in memory-bounded tiles."""
+    if not scenes:
+        raise GeoWatchError("No warped scenes are available for compositing.")
+    bands, height, width = scenes[0].data.shape
+    output = np.full((bands, height, width), np.nan, dtype=np.float32)
+    logger.info(
+        "Compositing {} scene(s) with {} method in {}x{} pixel chunks.",
+        len(scenes),
+        method,
+        chunk_size,
+        chunk_size,
+    )
+    for row_slice, col_slice in _iter_windows(height, width, chunk_size):
+        if method == "mean":
+            output[:, row_slice, col_slice] = _combine_mean_tile(
+                scenes,
+                row_slice,
+                col_slice,
+            )
+        elif method == "first":
+            output[:, row_slice, col_slice] = _combine_first_tile(
+                scenes,
+                row_slice,
+                col_slice,
+            )
+        else:
+            output[:, row_slice, col_slice] = _combine_median_tile(
+                scenes,
+                row_slice,
+                col_slice,
+            )
+    return output
+
+
+def _iter_windows(
+    height: int,
+    width: int,
+    chunk_size: int,
+) -> Iterator[tuple[slice, slice]]:
+    """Yield row and column slices for bounded raster processing."""
+    size = max(1, chunk_size)
+    for row in range(0, height, size):
+        row_slice = slice(row, min(row + size, height))
+        for col in range(0, width, size):
+            yield row_slice, slice(col, min(col + size, width))
+
+
+def _combine_median_tile(
+    scenes: list[RasterLayer],
+    row_slice: slice,
+    col_slice: slice,
+) -> np.ndarray:
+    """Return a median composite tile without allocating a full-scene stack."""
+    tile_stack = np.stack(
+        [
+            np.asarray(scene.data[:, row_slice, col_slice], dtype=np.float32)
+            for scene in scenes
+        ],
+        axis=0,
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+        return np.asarray(np.nanmedian(tile_stack, axis=0), dtype=np.float32)
+
+
+def _combine_mean_tile(
+    scenes: list[RasterLayer],
+    row_slice: slice,
+    col_slice: slice,
+) -> np.ndarray:
+    """Return a mean composite tile while ignoring nodata pixels."""
+    sample = np.asarray(scenes[0].data[:, row_slice, col_slice], dtype=np.float32)
+    total = np.zeros(sample.shape, dtype=np.float32)
+    count = np.zeros(sample.shape, dtype=np.uint16)
+    for scene in scenes:
+        tile = np.asarray(scene.data[:, row_slice, col_slice], dtype=np.float32)
+        valid = np.isfinite(tile)
+        total += np.where(valid, tile, 0.0).astype(np.float32)
+        count += valid.astype(np.uint16)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.asarray(np.where(count > 0, total / count, np.nan), dtype=np.float32)
+
+
+def _combine_first_tile(
+    scenes: list[RasterLayer],
+    row_slice: slice,
+    col_slice: slice,
+) -> np.ndarray:
+    """Return a first-valid-pixel composite tile."""
+    result = np.full(
+        np.asarray(scenes[0].data[:, row_slice, col_slice]).shape,
+        np.nan,
+        dtype=np.float32,
+    )
+    for scene in scenes:
+        tile = np.asarray(scene.data[:, row_slice, col_slice], dtype=np.float32)
+        result = np.where(np.isfinite(result), result, tile).astype(np.float32)
     return result
 
 

@@ -7,6 +7,7 @@ import io
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -16,6 +17,7 @@ from geowatch.acquisition.catalog import (
 )
 from geowatch.acquisition.download import (
     DownloadManager,
+    _friendly_streaming_error,
     build_download_requests,
     verify_download,
 )
@@ -142,6 +144,122 @@ def test_build_download_requests_limits_results(tmp_path: Path) -> None:
     )
 
     assert len(requests) == 1
+
+
+def test_sentinel_download_requests_skip_visual_assets(tmp_path: Path) -> None:
+    """Sentinel analytical downloads should not waste bandwidth on RGB previews."""
+    assets = tuple(
+        AssetMetadata(
+            name=name,
+            href=f"https://example.com/{name}.tif",
+            roles=("data",),
+        )
+        for name in ("B02", "B03", "B04", "B08", "B11", "B12", "SCL", "visual")
+    )
+    scene = SceneMetadata(
+        scene_id="sentinel-scene",
+        provider="planetary-computer",
+        dataset="sentinel-2-l2a",
+        acquired_at=datetime.now(UTC),
+        assets=assets,
+    )
+
+    requests = build_download_requests(
+        (scene,),
+        download_directory=tmp_path,
+        preferred_roles=("data", "visual"),
+        max_downloads=20,
+        max_bytes=100,
+    )
+
+    assert tuple(request.asset.name for request in requests) == (
+        "B02",
+        "B03",
+        "B04",
+        "B08",
+        "B11",
+        "B12",
+        "SCL",
+    )
+
+
+def test_streaming_error_redacts_signed_urls() -> None:
+    """Provider SAS tokens should never be exposed in terminal errors."""
+    message = _friendly_streaming_error(
+        "https://example.blob.core.windows.net/item/B08.tif?sig=SECRET&st=now",
+        TimeoutError("slow"),
+    )
+
+    assert "B08.tif" in message
+    assert "sig=" not in message
+    assert "SECRET" not in message
+
+
+def test_planetary_download_refreshes_expired_signed_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planetary Computer assets should be re-signed immediately before download."""
+    captured_urls: list[str] = []
+    asset = AssetMetadata(
+        name="B02",
+        href="https://example.blob.core.windows.net/item/B02.tif?sig=OLD",
+        roles=("data",),
+    )
+    scene = SceneMetadata(
+        scene_id="scene-pc",
+        provider="planetary-computer",
+        dataset="sentinel-2-l2a",
+        acquired_at=datetime.now(UTC),
+        assets=(asset,),
+    )
+    request = DownloadRequest(
+        scene=scene,
+        asset=asset,
+        destination=tmp_path / "b02.tif",
+    )
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self) -> None:
+            self.stream = io.BytesIO(b"fresh")
+            self.headers = {"Content-Length": "5"}
+
+        def getcode(self) -> int:
+            return self.status
+
+        def read(self, size: int = -1) -> bytes:
+            return self.stream.read(size)
+
+        def close(self) -> None:
+            self.stream.close()
+
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.close()
+
+    monkeypatch.setattr(
+        "geowatch.acquisition.download.planetary_sign_url",
+        lambda url: f"{url}?sig=FRESH",
+    )
+
+    def fake_urlopen(request_object: Any, **_kwargs: object) -> FakeResponse:
+        captured_urls.append(request_object.full_url)
+        return FakeResponse()
+
+    monkeypatch.setattr("geowatch.acquisition.download.urlopen", fake_urlopen)
+
+    result = DownloadManager(
+        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0)
+    ).download(request)
+
+    assert result.verified
+    assert captured_urls == [
+        "https://example.blob.core.windows.net/item/B02.tif?sig=FRESH"
+    ]
 
 
 def test_verify_download_rejects_missing_file(tmp_path: Path) -> None:

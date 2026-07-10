@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 
 from geowatch.analytics.models import ANALYTICS_INDEX_NAMES
+from geowatch.application.boundaries import BoundarySearchKind
 from geowatch.cartography.themes import MapThemeName
 
 TemporalMode = Literal["endpoints", "annual", "interval"]
@@ -25,6 +26,7 @@ class LocationSpec(BaseModel):
     name: str = Field(min_length=1)
     country: str = Field(min_length=1)
     region: str | None = None
+    boundary_kind: BoundarySearchKind = "city"
     administrative_level: str | None = None
     boundary_path: Path | None = None
     boundary_source: str | None = None
@@ -41,6 +43,22 @@ class TemporalSpec(BaseModel):
     end_month: int = Field(default=9, ge=1, le=12)
     mode: TemporalMode = "endpoints"
     interval_years: int = Field(default=1, ge=1, le=50)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_mode(cls, data: object) -> object:
+        """Accept case-insensitive temporal modes from older saved projects."""
+        return _normalize_mapping_choice(
+            data,
+            "mode",
+            {
+                "endpoint": "endpoints",
+                "endpoints": "endpoints",
+                "annual": "annual",
+                "yearly": "annual",
+                "interval": "interval",
+            },
+        )
 
     @model_validator(mode="after")
     def validate_period(self) -> TemporalSpec:
@@ -71,6 +89,36 @@ class ImagerySpec(BaseModel):
     max_scenes_per_year: int = Field(default=3, ge=1, le=20)
     composite_method: Literal["median", "mean", "first"] = "median"
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_imagery_choices(cls, data: object) -> object:
+        """Accept case-insensitive sensor/provider choices from YAML."""
+        data = _normalize_mapping_choice(
+            data,
+            "sensor",
+            {
+                "auto": "auto",
+                "landsat": "landsat",
+                "sentinel": "sentinel-2",
+                "sentinel2": "sentinel-2",
+                "sentinel_2": "sentinel-2",
+                "sentinel-2": "sentinel-2",
+            },
+        )
+        return _normalize_mapping_choice(
+            data,
+            "provider",
+            {
+                "auto": "auto",
+                "planetarycomputer": "planetary-computer",
+                "planetary_computer": "planetary-computer",
+                "planetary-computer": "planetary-computer",
+                "microsoft": "planetary-computer",
+                "usgs": "usgs",
+                "copernicus": "copernicus",
+            },
+        )
+
 
 class AnalysisSpec(BaseModel):
     """Index, change detection, and classification settings."""
@@ -87,6 +135,28 @@ class AnalysisSpec(BaseModel):
     )
     classification: ClassificationMethod = "kmeans"
     training_data: Path | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_classification(cls, data: object) -> object:
+        """Accept case-insensitive classification names from YAML."""
+        return _normalize_mapping_choice(
+            data,
+            "classification",
+            {
+                "kmeans": "kmeans",
+                "k_means": "kmeans",
+                "k-means": "kmeans",
+                "isodata": "isodata",
+                "random_forest": "random_forest",
+                "random-forest": "random_forest",
+                "randomforest": "random_forest",
+                "xgboost": "xgboost",
+                "xgb": "xgboost",
+                "svm": "svm",
+                "none": "none",
+            },
+        )
 
     @model_validator(mode="after")
     def validate_analysis(self) -> AnalysisSpec:
@@ -116,6 +186,26 @@ class OutputSpec(BaseModel):
     max_workers: int = Field(default=2, ge=1, le=64)
     map_theme: MapThemeName = "academic"
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_map_theme(cls, data: object) -> object:
+        """Accept readable map theme labels in saved YAML."""
+        return _normalize_mapping_choice(
+            data,
+            "map_theme",
+            {
+                "academic": "academic",
+                "academic_thesis": "academic",
+                "government": "government",
+                "government_report": "government",
+                "journal": "journal",
+                "minimal_journal": "journal",
+                "presentation": "presentation",
+                "dark": "dark",
+                "dark_dashboard": "dark",
+            },
+        )
+
 
 class RunSpecification(BaseModel):
     """Complete, serializable contract for one GeoWatch project."""
@@ -137,3 +227,27 @@ class RunSpecification(BaseModel):
             self.imagery.sensor,
             self.imagery.provider,
         )
+
+
+def _normalize_mapping_choice(
+    data: object,
+    field: str,
+    aliases: dict[str, str],
+) -> object:
+    """Normalize one string choice in a Pydantic before-validator payload."""
+    if not isinstance(data, dict):
+        return data
+    value = data.get(field)
+    if not isinstance(value, str):
+        return data
+    key = _choice_key(value)
+    if key not in aliases:
+        return data
+    updated: dict[str, Any] = dict(data)
+    updated[field] = aliases[key]
+    return updated
+
+
+def _choice_key(value: str) -> str:
+    """Return a forgiving comparison key for saved user-facing choices."""
+    return value.strip().casefold().replace(" ", "_")

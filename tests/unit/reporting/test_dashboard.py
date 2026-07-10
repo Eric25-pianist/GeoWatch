@@ -66,7 +66,7 @@ def test_dashboard_contains_slider_statistics_and_portable_links(
 
     document = dashboard.read_text(encoding="utf-8")
     assert "data-compare" in document
-    assert "Before · 2018" in document
+    assert "Before &middot; 2018" in document
     assert "Sentinel-2 L2A" in document
     assert "LULC transition matrix" in document
     assert "Unsupervised K-Means" in document

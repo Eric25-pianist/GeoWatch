@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import socket
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from loguru import logger
+
+try:
+    from planetary_computer import sign_url as planetary_sign_url
+except ImportError:  # pragma: no cover - validated by production doctor
+    planetary_sign_url = None
 
 from geowatch.acquisition.http import AcquisitionError, HTTPClient
 from geowatch.acquisition.models import (
@@ -58,14 +64,15 @@ class DownloadManager:
         client = self.http_client
 
         def action() -> DownloadResult:
+            download_url = _download_url(request)
             response = client.request(
                 "GET",
-                str(request.asset.href),
+                download_url,
                 timeout=self.timeout,
             )
             if not response.ok:
                 msg = (
-                    f"Download failed for {request.asset.href}: "
+                    f"Download failed for {_safe_url(download_url)}: "
                     f"HTTP {response.status_code}"
                 )
                 raise AcquisitionError(msg)
@@ -101,13 +108,13 @@ class DownloadManager:
         partial = destination.with_suffix(destination.suffix + ".part")
         existing = partial.stat().st_size if partial.exists() else 0
         headers = {"Range": f"bytes={existing}-"} if existing else {}
-        http_request = Request(str(request.asset.href), headers=headers)
+        download_url = _download_url(request)
+        http_request = Request(download_url, headers=headers)
         try:
             response = urlopen(http_request, timeout=self.timeout)
         except (HTTPError, URLError, TimeoutError) as exc:
-            raise AcquisitionError(
-                f"Streaming download failed for {request.asset.href}: {exc}"
-            ) from exc
+            message = _friendly_streaming_error(download_url, exc)
+            raise AcquisitionError(message) from exc
 
         status = int(getattr(response, "status", response.getcode()))
         append = existing > 0 and status == 206
@@ -195,7 +202,7 @@ def _rank_assets_for_download(
     """Prioritize assets that are useful for NDVI and general analysis."""
     preferred_names: tuple[str, ...]
     if scene.dataset == "sentinel-2-l2a":
-        preferred_names = ("B02", "B03", "B04", "B08", "B11", "B12", "SCL", "visual")
+        preferred_names = ("B02", "B03", "B04", "B08", "B11", "B12", "SCL")
     elif scene.dataset in {"landsat-5-c2-l2", "landsat-7-c2-l2"}:
         preferred_names = (
             "blue",
@@ -255,6 +262,53 @@ def _rank_assets_for_download(
             ranked.append(asset)
             seen.add(key)
     return tuple(ranked)
+
+
+def _safe_url(value: str) -> str:
+    """Return a URL without query parameters or fragments for safe logs."""
+    parsed = urlparse(value)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def _download_url(request: DownloadRequest) -> str:
+    """Return a fresh download URL, re-signing Planetary Computer assets if needed."""
+    href = str(request.asset.href)
+    if request.scene.provider != "planetary-computer":
+        return href
+    if planetary_sign_url is None:
+        raise AcquisitionError(
+            "Planetary Computer downloads require the 'planetary-computer' package. "
+            "Run setup-micromamba.ps1 and try again."
+        )
+    return str(planetary_sign_url(_safe_url(href)))
+
+
+def _friendly_streaming_error(url: str, exc: BaseException) -> str:
+    """Explain streaming failures without leaking signed provider URLs."""
+    safe_url = _safe_url(url)
+    reason = exc.reason if isinstance(exc, URLError) else exc
+    if _is_dns_error(reason):
+        host = urlparse(url).netloc or "the imagery provider host"
+        return (
+            f"Could not resolve imagery asset host '{host}' while downloading "
+            f"{safe_url}. Check internet/DNS/VPN/firewall settings, then run "
+            "`geowatch resume <project.yaml>`; verified files will be reused."
+        )
+    if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+        return (
+            f"Streaming download timed out for {safe_url}. Retry with "
+            "`geowatch resume <project.yaml>`; verified files will be reused."
+        )
+    return f"Streaming download failed for {safe_url}: {reason}"
+
+
+def _is_dns_error(reason: object) -> bool:
+    """Return True for Windows and cross-platform DNS resolution failures."""
+    return isinstance(reason, socket.gaierror) or getattr(reason, "winerror", None) in {
+        11001,
+        11002,
+        11004,
+    }
 
 
 def verify_download(

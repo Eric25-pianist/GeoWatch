@@ -64,10 +64,35 @@ Create or update the reproducible project-local environment:
 
 The script downloads a local Micromamba runtime when needed, creates
 `.mamba-root\envs\geowatch`, installs GeoWatch with that environment's Python,
-and stops if any required validation fails. It does not fall back to the system
-Python installation.
+installs a Windows command shortcut, and stops if any required validation fails.
+It does not fall back to the system Python installation.
 
-For the current PowerShell session, define these shortcuts:
+After a successful setup, open a new PowerShell window or continue in the same
+window and run GeoWatch like a normal command:
+
+```powershell
+geowatch
+```
+
+Typing only `geowatch` opens the guided project wizard. Subcommands are also
+available directly:
+
+```powershell
+geowatch doctor --strict
+geowatch wizard
+geowatch process outputs\Karachi\project.yaml
+geowatch resume outputs\Karachi\project.yaml
+```
+
+The installer adds a command wrapper at
+`%LOCALAPPDATA%\GeoWatch\bin\geowatch.cmd`, updates your user PATH, and writes a
+PowerShell profile function so `geowatch` wins even if an older broken Python
+launcher exists elsewhere on the machine. If you move the repository folder
+after installation, rerun `.\setup-micromamba.ps1` so the shortcut points at the
+new project-local environment.
+
+If you need the direct Micromamba command for troubleshooting, define these
+shortcuts:
 
 ```powershell
 $mm = "D:\ProjectGeoWatch\.tools\Library\bin\micromamba.exe"
@@ -81,7 +106,7 @@ script in that case.
 Verify the production environment:
 
 ```powershell
-& $mm --root-prefix $root run -n geowatch geowatch doctor --strict
+geowatch doctor --strict
 ```
 
 The strict doctor must pass Python, pip, GDAL, Rasterio, GeoPandas, Shapely,
@@ -108,7 +133,7 @@ native GIS libraries together.
 Start the guided application:
 
 ```powershell
-& $mm --root-prefix $root run -n geowatch geowatch wizard
+geowatch
 ```
 
 The wizard asks for the location, country/region, comparison years, seasonal
@@ -120,22 +145,22 @@ By default, the wizard creates the project and begins processing. To create and
 inspect the specification without downloading imagery:
 
 ```powershell
-& $mm --root-prefix $root run -n geowatch geowatch wizard --setup-only
+geowatch wizard --setup-only
 ```
 
 Then run, resume, or inspect that saved project:
 
 ```powershell
-& $mm --root-prefix $root run -n geowatch geowatch process outputs\Karachi\project.yaml
-& $mm --root-prefix $root run -n geowatch geowatch resume outputs\Karachi\project.yaml
-& $mm --root-prefix $root run -n geowatch geowatch status outputs\Karachi\project.yaml
-& $mm --root-prefix $root run -n geowatch geowatch quality outputs\Karachi\project.yaml
+geowatch process outputs\Karachi\project.yaml
+geowatch resume outputs\Karachi\project.yaml
+geowatch status outputs\Karachi\project.yaml
+geowatch quality outputs\Karachi\project.yaml
 ```
 
 Override the saved map theme for a processing run:
 
 ```powershell
-& $mm --root-prefix $root run -n geowatch geowatch process outputs\Karachi\project.yaml --map-theme government
+geowatch process outputs\Karachi\project.yaml --map-theme government
 ```
 
 Available theme names are `academic`, `government`, `journal`, `presentation`,
@@ -242,9 +267,20 @@ folders together so relative map and download links remain valid.
 The wizard can search OpenStreetMap Nominatim for polygonal administrative
 boundaries or accept a local GeoJSON, Shapefile, or GeoPackage. It checks
 geometry validity, CRS, coordinate ranges, plausible area, and provenance, then
-creates a preview for human confirmation. Boundary names and administrative
-levels vary between countries; the user remains responsible for choosing the
-intended legal/statistical boundary.
+creates a preview for human confirmation. During online search, choose the
+boundary intent carefully: city/municipality, urban core/special wards,
+district/county/division, state/province/prefecture, or auto. GeoWatch ranks
+candidates against that intent and warns when a candidate is broad, multipart,
+or geographically dispersed.
+
+Boundary names and administrative levels vary between countries; the user
+remains responsible for choosing the intended legal/statistical boundary. For
+example, a search for Tokyo may return Tokyo Metropolis/Prefecture, which is an
+authentic administrative boundary but includes remote island municipalities and
+does not resemble a compact "Tokyo city core" or "23 special wards" map. For
+thesis, consultancy, or government-style products, reject unexpected candidates
+and provide an official local boundary file when the online source does not
+match the intended study area.
 
 ### Imagery
 
@@ -329,8 +365,7 @@ snippet, dashboard launcher, and machine-readable metadata.
 Confirm that the command is running inside the project-local environment:
 
 ```powershell
-& $mm --root-prefix $root run -n geowatch python --version
-& $mm --root-prefix $root run -n geowatch geowatch doctor --strict
+geowatch doctor --strict
 ```
 
 Do not use a system Python 3.14 installation for the production workflow. If
@@ -348,8 +383,10 @@ find a scientifically consistent policy for every requested year.
 
 ### The wrong boundary is proposed
 
-Reject it in the wizard and provide a trusted local boundary file. Similar city,
-district, division, metropolitan, and province names often represent very
+Reject it in the wizard and try another boundary intent, such as urban/core,
+district/division, or state/province. If the correct candidate is still not
+offered, provide a trusted local GeoJSON, Shapefile, or GeoPackage. Similar
+city, district, division, metropolitan, and province names often represent very
 different areas.
 
 ### A run was interrupted

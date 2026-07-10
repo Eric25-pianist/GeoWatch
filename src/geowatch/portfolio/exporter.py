@@ -504,8 +504,8 @@ def _write_summary_infographic(
         fill="#d8e6f2",
     )
 
-    left_panel = (40, 240, 610, 1135)
-    right_panel = (640, 240, 1560, 1135)
+    left_panel = (40, 240, 610, 1160)
+    right_panel = (640, 240, 1560, 1160)
     draw.rounded_rectangle(left_panel, radius=24, fill="white", outline="#d3dde7")
     draw.rounded_rectangle(right_panel, radius=24, fill="white", outline="#d3dde7")
 
@@ -542,7 +542,7 @@ def _write_summary_infographic(
     draw.text((670, 270), "Showcase maps", font=heading_font, fill="#16324f")
     _paste_showcase_thumbnails(canvas, copied_maps)
 
-    note_y = 1030
+    note_y = 988
     draw.text(
         (668, note_y),
         "Data source and projection note",
@@ -560,8 +560,10 @@ def _write_summary_infographic(
         "GeoWatch Project attribution",
     ]
     for note in notes:
-        draw.text((670, note_y), note, font=small_font, fill="#3d5368")
-        note_y += 28
+        for line in textwrap.wrap(note, width=78):
+            draw.text((670, note_y), line, font=small_font, fill="#3d5368")
+            note_y += 25
+        note_y += 3
 
     canvas.save(output_path, format="PNG", optimize=True)
     return output_path

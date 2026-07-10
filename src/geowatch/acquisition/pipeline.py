@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from datetime import datetime as dt
 from pathlib import Path
 
@@ -18,10 +19,12 @@ from geowatch.acquisition.download import DownloadManager, build_download_reques
 from geowatch.acquisition.http import AcquisitionError, HTTPClient
 from geowatch.acquisition.models import (
     AcquisitionResult,
+    DownloadRequest,
     DownloadResult,
     SceneMetadata,
     SearchQuery,
 )
+from geowatch.acquisition.retry import RetryPolicy
 from geowatch.acquisition.selector import (
     build_provider,
     choose_datasets,
@@ -48,6 +51,8 @@ def run_acquisition(
         if config.acquisition.provider != "auto"
         else rank_providers(datasets)
     )
+    if config.acquisition.selected_scene_ids and config.acquisition.provider == "auto":
+        provider_names = ("planetary-computer",)
     bbox = _resolve_query_bbox(config, base_dir=base_dir)
     query = SearchQuery(
         bbox=bbox,
@@ -82,26 +87,27 @@ def run_acquisition(
                 scenes = tuple(scene for scene in scenes if scene.scene_id in selected)
             _require_scenes(scenes, provider.name, datasets)
             downloads = _download_if_requested(config, scenes, http_client=http_client)
+            acquired_scenes = _scenes_with_downloads(scenes, downloads)
             catalog_path = write_metadata_catalog(
-                scenes,
+                acquired_scenes,
                 downloads,
                 config.acquisition.metadata_catalog,
                 provider=provider.name,
             )
             report_path = write_acquisition_report(
-                scenes,
+                acquired_scenes,
                 downloads,
                 config.acquisition.acquisition_report,
                 provider=provider.name,
             )
             logger.bind(channel="pipeline").info(
                 "Acquisition completed with {} scenes and {} downloads.",
-                len(scenes),
+                len(acquired_scenes),
                 len(downloads),
             )
             return AcquisitionResult(
                 provider=provider.name,
-                scenes=scenes,
+                scenes=acquired_scenes,
                 downloads=downloads,
                 catalog_path=catalog_path,
                 report_path=report_path,
@@ -110,7 +116,15 @@ def run_acquisition(
             last_error = exc
             logger.warning("Provider {} failed: {}", provider_name, exc)
             continue
-    raise AcquisitionError("All acquisition providers failed.") from last_error
+    if last_error is not None:
+        if len(provider_names) == 1:
+            raise AcquisitionError(
+                f"Acquisition provider {provider_names[0]} failed: {last_error}"
+            ) from last_error
+        raise AcquisitionError(
+            f"All acquisition providers failed. Last error: {last_error}"
+        ) from last_error
+    raise AcquisitionError("All acquisition providers failed.")
 
 
 def _download_if_requested(
@@ -131,9 +145,65 @@ def _download_if_requested(
     )
     manager = DownloadManager(
         http_client=http_client,
+        retry_policy=RetryPolicy(
+            attempts=config.acquisition.retry_attempts,
+            backoff_seconds=config.acquisition.retry_backoff_seconds,
+        ),
         timeout=config.acquisition.request_timeout_seconds,
     )
-    return tuple(manager.download(request) for request in requests)
+    downloads: list[DownloadResult] = []
+    failures: list[str] = []
+    for scene_id, scene_requests in _group_requests_by_scene(requests).items():
+        scene_downloads: list[DownloadResult] = []
+        try:
+            for request in scene_requests:
+                scene_downloads.append(manager.download(request))
+        except AcquisitionError as exc:
+            failures.append(f"{scene_id}: {exc}")
+            logger.warning(
+                "Skipping incomplete scene {} after download failure: {}",
+                scene_id,
+                exc,
+            )
+            continue
+        downloads.extend(scene_downloads)
+    if not downloads:
+        detail = f" First failure: {failures[0]}" if failures else ""
+        raise AcquisitionError(f"No complete scenes were downloaded.{detail}")
+    if failures:
+        logger.warning(
+            "Downloaded {} complete scene(s); skipped {} incomplete scene(s). "
+            "Processing will validate final AOI coverage.",
+            len({download.scene_id for download in downloads}),
+            len(failures),
+        )
+    return tuple(downloads)
+
+
+def _group_requests_by_scene(
+    requests: tuple[DownloadRequest, ...],
+) -> dict[str, tuple[DownloadRequest, ...]]:
+    """Group download requests so incomplete scenes can be skipped safely."""
+    grouped: defaultdict[str, list[DownloadRequest]] = defaultdict(list)
+    for request in requests:
+        grouped[request.scene.scene_id].append(request)
+    return {
+        scene_id: tuple(scene_requests)
+        for scene_id, scene_requests in grouped.items()
+    }
+
+
+def _scenes_with_downloads(
+    scenes: tuple[SceneMetadata, ...],
+    downloads: tuple[DownloadResult, ...],
+) -> tuple[SceneMetadata, ...]:
+    """Return only scenes represented by verified downloads."""
+    if not downloads:
+        return scenes
+    complete_scene_ids = {
+        download.scene_id for download in downloads if download.verified
+    }
+    return tuple(scene for scene in scenes if scene.scene_id in complete_scene_ids)
 
 
 def _resolve_query_bbox(

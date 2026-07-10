@@ -158,7 +158,15 @@ def _index_difference_score(
     if not index_results:
         raise ChangeDetectionError("Index differencing requires spectral index maps.")
     stack = np.stack([result.difference for result in index_results.values()], axis=0)
-    score = np.nanmean(np.abs(stack), axis=0)
+    absolute_stack = np.abs(stack)
+    finite_count = np.sum(np.isfinite(absolute_stack), axis=0)
+    score = np.full(absolute_stack.shape[1:], np.nan, dtype=np.float32)
+    np.divide(
+        np.nansum(absolute_stack, axis=0),
+        finite_count,
+        out=score,
+        where=finite_count > 0,
+    )
     return cast(NDArray[np.float32], np.asarray(score, dtype=np.float32))
 
 

@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 
@@ -78,6 +79,14 @@ MAP_NAMES: tuple[str, ...] = (
 )
 
 _NORTH_ARROW_COLOR = "#f97316"
+
+
+def _masked_array(data: Any, mask: Any) -> Any:
+    """Create a NumPy masked array while isolating NumPy's incomplete typing."""
+    masked_array_factory: Any = np.ma.array
+    return masked_array_factory(data, mask=mask)
+
+
 _TITLE_COLOR = "#102a43"
 _SUBTITLE_COLOR = "#243b53"
 _FOOTER_COLOR = "#334e68"
@@ -402,9 +411,10 @@ def _render_classification_map(
     )
     overlay_path = output_dir / f"{name}_overlay.png"
     valid_mask = (labels >= 0) & (labels < len(class_names))
+    masked_overlay = _masked_array(labels, ~valid_mask)
     plt.imsave(
         overlay_path,
-        np.ma.array(labels, mask=~valid_mask),
+        masked_overlay,
         cmap=cmap,
         vmin=-0.5,
         vmax=float(len(class_names) - 0.5),
@@ -787,10 +797,7 @@ def _build_classification_figure(
     )
     extent = _grid_extent(grid)
     valid_mask = (labels >= 0) & (labels < len(class_names))
-    masked_labels = np.ma.array(
-        labels,
-        mask=~valid_mask,
-    )
+    masked_labels = _masked_array(labels, ~valid_mask)
     display_cmap = cmap.with_extremes(bad=(1.0, 1.0, 1.0, 0.0))
     _add_geometry_background(ax, aoi_geometry, aoi_crs, grid, theme=theme)
     _draw_reference_basemap(ax, grid, reference_rgb, theme=theme)

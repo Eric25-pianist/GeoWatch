@@ -41,7 +41,7 @@ class AcquisitionConfig(BaseModel):
     )
     max_cloud_cover: float = Field(default=20.0, ge=0.0, le=100.0)
     max_results: int = Field(default=10, ge=1, le=500)
-    max_downloads: int = Field(default=1, ge=1, le=100)
+    max_downloads: int = Field(default=1, ge=1, le=1000)
     download_directory: Path = Path("data/raw")
     metadata_catalog: Path = Path("outputs/manifests/acquisition_catalog.json")
     acquisition_report: Path = Path("outputs/reports/acquisition_report.md")

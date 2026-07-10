@@ -7,12 +7,12 @@ from typing import Any, cast
 
 from loguru import logger
 
-try:
-    from planetary_computer import sign_url
-except ImportError:  # pragma: no cover - optional dependency
-    sign_url = None
-
-from geowatch.acquisition.http import AcquisitionError, HTTPClient, UrllibHTTPClient
+from geowatch.acquisition.http import (
+    AcquisitionError,
+    HTTPClient,
+    NonRetryableAcquisitionError,
+    UrllibHTTPClient,
+)
 from geowatch.acquisition.models import (
     AssetMetadata,
     ChecksumAlgorithm,
@@ -73,6 +73,8 @@ class STACClient:
                     f"STAC search failed for {self.provider}: "
                     f"HTTP {response.status_code}"
                 )
+                if response.status_code not in self.retry_policy.retry_statuses:
+                    raise NonRetryableAcquisitionError(msg)
                 raise AcquisitionError(msg)
             payload = response.json()
             features = payload.get("features", [])
@@ -118,17 +120,13 @@ def normalize_stac_item(
         acquired_at=acquired_at,
         bbox=bbox,
         cloud_cover=cloud_cover,
-        assets=tuple(_normalize_assets(assets, provider=provider)),
+        assets=tuple(_normalize_assets(assets)),
         metadata=properties,
         source_url=_source_url(item),
     )
 
 
-def _normalize_assets(
-    assets: dict[str, object],
-    *,
-    provider: ProviderName,
-) -> list[AssetMetadata]:
+def _normalize_assets(assets: dict[str, object]) -> list[AssetMetadata]:
     normalized: list[AssetMetadata] = []
     for name, raw_asset in assets.items():
         if not isinstance(raw_asset, dict):
@@ -136,8 +134,6 @@ def _normalize_assets(
         href = raw_asset.get("href")
         if not isinstance(href, str) or not href:
             continue
-        if provider == "planetary-computer" and sign_url is not None:
-            href = sign_url(href)
         roles_value = raw_asset.get("roles", ())
         roles = (
             tuple(str(role) for role in roles_value)

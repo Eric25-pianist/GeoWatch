@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from geowatch.application.models import (
+    AnalysisSpec,
+    ImagerySpec,
     LocationSpec,
     OutputSpec,
     RunSpecification,
@@ -48,3 +50,27 @@ def test_annual_and_interval_years_include_end_year() -> None:
 
     assert annual.years() == (2010, 2011, 2012, 2013)
     assert interval.years() == (2010, 2012, 2014, 2015)
+
+
+def test_saved_project_choices_are_case_insensitive() -> None:
+    """Older or hand-edited project YAML should not fail on readable casing."""
+    spec = RunSpecification.model_validate(
+        {
+            "schema_version": "1.0",
+            "location": {"name": "Lahore", "country": "Pakistan"},
+            "temporal": {
+                "start_year": 2015,
+                "end_year": 2017,
+                "mode": "Annual",
+            },
+            "imagery": {"sensor": "LANDSAT", "provider": "USGS"},
+            "analysis": {"classification": "Isodata"},
+            "outputs": {"map_theme": "Dark Dashboard"},
+        }
+    )
+
+    assert spec.temporal.mode == "annual"
+    assert spec.temporal.years() == (2015, 2016, 2017)
+    assert spec.imagery == ImagerySpec(sensor="landsat", provider="usgs")
+    assert spec.analysis == AnalysisSpec(classification="isodata")
+    assert spec.outputs.map_theme == "dark"

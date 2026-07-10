@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from loguru import logger
 
-from geowatch.acquisition.http import AcquisitionError
+from geowatch.acquisition.http import AcquisitionError, NonRetryableAcquisitionError
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,8 @@ def retry_call[T](action: Callable[[], T], policy: RetryPolicy) -> T:
     for attempt in range(1, policy.attempts + 1):
         try:
             return action()
+        except NonRetryableAcquisitionError:
+            raise
         except AcquisitionError as exc:
             last_error = exc
             logger.warning(

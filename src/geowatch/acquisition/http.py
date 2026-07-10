@@ -18,6 +18,10 @@ class AcquisitionError(GeoWatchError):
     """Raised when acquisition operations fail."""
 
 
+class NonRetryableAcquisitionError(AcquisitionError):
+    """Raised when retrying the same acquisition request cannot help."""
+
+
 class HTTPClient(Protocol):
     """Protocol implemented by HTTP clients used in acquisition."""
 
@@ -114,6 +118,15 @@ def _friendly_url_error(url: str, exc: urllib.error.URLError) -> str:
         return (
             f"HTTP request timed out for {url}. The remote provider did not respond "
             "in time."
+        )
+    if (
+        isinstance(reason, socket.gaierror)
+        or getattr(reason, "winerror", None) == 11002
+    ):
+        return (
+            f"Could not resolve the imagery provider host for {url}. Check that the "
+            "PC is connected to the internet, DNS is working, and firewall/VPN "
+            "settings allow access to the provider."
         )
     if reason:
         return f"HTTP request failed for {url}: {reason}"

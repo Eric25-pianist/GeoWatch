@@ -7,8 +7,9 @@ import json
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from math import log10
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -20,7 +21,7 @@ matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 from loguru import logger
 from pyproj import Transformer
-from shapely.geometry import Point, mapping, shape
+from shapely.geometry import Point, box, mapping, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform
 from shapely.validation import make_valid
@@ -30,6 +31,7 @@ from geowatch.utils.geometry import load_vector_geometry
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 USER_AGENT = "GeoWatch/0.1 (local research GIS application)"
+BoundarySearchKind = Literal["auto", "city", "district", "state", "urban"]
 
 
 @dataclass(frozen=True)
@@ -53,26 +55,65 @@ class BoundaryCandidate:
         west, south, east, north = self.geometry.bounds
         return float(west), float(south), float(east), float(north)
 
+    @property
+    def part_count(self) -> int:
+        """Return the number of polygon parts in the boundary."""
+        if self.geometry.geom_type == "MultiPolygon":
+            return len(self.geometry.geoms)
+        return 1
+
+    @property
+    def bbox_span_degrees(self) -> tuple[float, float]:
+        """Return longitude and latitude span of the boundary extent."""
+        west, south, east, north = self.bounds
+        return float(east - west), float(north - south)
+
+    @property
+    def bbox_to_area_ratio(self) -> float:
+        """Return projected bounding-box area divided by actual AOI area."""
+        if self.area_sq_km <= 0:
+            return float("inf")
+        return _area_sq_km(box(*self.bounds)) / self.area_sq_km
+
+    @property
+    def is_spatially_dispersed(self) -> bool:
+        """Return True when a boundary likely includes remote islands or exclaves."""
+        lon_span, lat_span = self.bbox_span_degrees
+        return (
+            (self.part_count >= 4 and max(lon_span, lat_span) >= 2.0)
+            or (self.part_count >= 2 and max(lon_span, lat_span) >= 8.0)
+            or (self.part_count >= 3 and self.bbox_to_area_ratio >= 25.0)
+        )
+
 
 def search_boundaries(
     location: str,
     country: str,
     region: str | None = None,
     *,
+    boundary_kind: BoundarySearchKind = "city",
     limit: int = 5,
 ) -> tuple[BoundaryCandidate, ...]:
     """Search OpenStreetMap for polygonal administrative candidates."""
     candidates: list[BoundaryCandidate] = []
     seen_sources: set[str] = set()
-    queries = _boundary_queries(location, country, region)
+    queries = _boundary_queries(location, country, region, boundary_kind)
     for query in queries:
         for candidate in _search_nominatim_query(query, location, limit=limit):
             if candidate.source_url in seen_sources:
                 continue
             seen_sources.add(candidate.source_url)
             candidates.append(candidate)
-        if candidates:
-            return tuple(candidates[:limit])
+        if len(candidates) >= max(limit * 2, 8):
+            break
+    if candidates:
+        ranked = sorted(
+            candidates,
+            key=lambda candidate: _candidate_rank(
+                candidate, location, boundary_kind
+            ),
+        )
+        return tuple(ranked[:limit])
     attempted = "; ".join(queries)
     raise GeoWatchError(
         "No polygon boundary found. Tried: "
@@ -113,6 +154,8 @@ def _search_nominatim_query(
             raw_address if isinstance(raw_address, dict) else {}
         )
         extra: dict[str, object] = raw_extra if isinstance(raw_extra, dict) else {}
+        if not _is_administrative_boundary(item, extra):
+            continue
         candidate = BoundaryCandidate(
             name=str(item.get("name") or location),
             display_name=str(item.get("display_name") or query),
@@ -132,30 +175,120 @@ def _search_nominatim_query(
     return tuple(candidates)
 
 
+def _is_administrative_boundary(
+    item: dict[str, object],
+    extra: dict[str, object],
+) -> bool:
+    """Return True only for administrative boundary features."""
+    item_class = _optional_string(item.get("class"))
+    item_type = _optional_string(item.get("type"))
+    boundary_tag = _optional_string(extra.get("boundary"))
+    admin_level = _optional_string(extra.get("admin_level"))
+    return (
+        admin_level is not None
+        or boundary_tag == "administrative"
+        or (item_class == "boundary" and item_type == "administrative")
+    )
+
+
 def _boundary_queries(
     location: str,
     country: str,
     region: str | None,
+    boundary_kind: BoundarySearchKind = "city",
 ) -> tuple[str, ...]:
     """Build forgiving administrative-boundary queries for common naming patterns."""
     location = location.strip()
     country = country.strip()
     region = region.strip() if region else None
     base = ", ".join(value for value in (location, region, country) if value)
-    names = (
-        location,
-        f"{location} District",
-        f"District {location}",
-        f"{location} Division",
-        f"{location} City",
-        f"{location} Metropolitan",
-    )
+    names_by_kind: dict[BoundarySearchKind, tuple[str, ...]] = {
+        "auto": (
+            location,
+            f"{location} City",
+            f"City of {location}",
+            f"{location} Municipality",
+            f"{location} District",
+            f"District {location}",
+            f"{location} Division",
+            f"{location} Province",
+            f"{location} Prefecture",
+            f"{location} State",
+            f"{location} Metropolitan",
+        ),
+        "city": (
+            f"{location} City",
+            f"City of {location}",
+            f"{location} Municipality",
+            f"{location} Metropolitan Municipality",
+            f"{location} District",
+            location,
+        ),
+        "district": (
+            f"{location} District",
+            f"District {location}",
+            f"{location} Division",
+            f"{location} County",
+            f"{location} Governorate",
+            location,
+        ),
+        "state": (
+            f"{location} Province",
+            f"{location} Prefecture",
+            f"{location} State",
+            f"{location} Region",
+            f"{location} Metropolitan",
+            location,
+        ),
+        "urban": (
+            f"{location} special wards",
+            f"{location} 23 special wards",
+            f"Special wards of {location}",
+            f"{location} urban area",
+            f"{location} City",
+            f"City of {location}",
+            location,
+        ),
+    }
+    names = names_by_kind[boundary_kind]
     queries = [base]
     for name in names:
         query = ", ".join(value for value in (name, region, country) if value)
         queries.append(query)
     queries.append(", ".join(value for value in (location, country) if value))
     return tuple(dict.fromkeys(query for query in queries if query))
+
+
+def boundary_warning_messages(
+    candidate: BoundaryCandidate,
+    *,
+    requested_kind: BoundarySearchKind = "auto",
+) -> tuple[str, ...]:
+    """Return non-fatal warnings that require careful user confirmation."""
+    warnings: list[str] = []
+    level = _admin_level_int(candidate)
+    lon_span, lat_span = candidate.bbox_span_degrees
+    if candidate.is_spatially_dispersed:
+        warnings.append(
+            "This boundary is multipart and geographically dispersed "
+            f"({candidate.part_count} parts spanning {lon_span:.1f} deg longitude "
+            f"and {lat_span:.1f} deg latitude). It may include islands, exclaves, "
+            "or distant administrative areas."
+        )
+    if requested_kind in {"city", "urban"} and level is not None and level <= 4:
+        warnings.append(
+            "The selected candidate is a high-level state/prefecture-style "
+            "boundary, not a city/municipality boundary. If you expected an "
+            "urban core, reject it and choose a ward/municipality boundary or "
+            "provide a local official file."
+        )
+    if requested_kind == "urban" and candidate.area_sq_km > 2_500:
+        warnings.append(
+            "The selected area is much larger than a typical urban-core map. "
+            "Confirm only if you intentionally want the whole administrative "
+            "region."
+        )
+    return tuple(warnings)
 
 
 def candidate_from_file(path: Path, *, name: str) -> BoundaryCandidate:
@@ -203,6 +336,12 @@ def validate_candidate(
         raise GeoWatchError("Boundary country does not match the requested country.")
     findings.append("Geometry is valid and polygonal.")
     findings.append(f"Boundary area is {candidate.area_sq_km:,.2f} km2.")
+    findings.append(f"Boundary contains {candidate.part_count} polygon part(s).")
+    lon_span, lat_span = candidate.bbox_span_degrees
+    findings.append(
+        "Boundary extent spans "
+        f"{lon_span:.2f} deg longitude by {lat_span:.2f} deg latitude."
+    )
     findings.append("Boundary coordinates are valid WGS84 longitude/latitude values.")
     return tuple(findings)
 
@@ -213,6 +352,7 @@ def save_boundary_candidate(
     source_path: Path,
     validated_path: Path,
     metadata_path: Path,
+    requested_kind: BoundarySearchKind = "auto",
 ) -> tuple[Path, Path, Path]:
     """Persist original/validated GeoJSON and a provenance record."""
     for path in (source_path, validated_path, metadata_path):
@@ -242,6 +382,12 @@ def save_boundary_candidate(
         "area_sq_km": candidate.area_sq_km,
         "centroid": candidate.centroid,
         "bbox": candidate.bounds,
+        "part_count": candidate.part_count,
+        "bbox_span_degrees": candidate.bbox_span_degrees,
+        "bbox_to_area_ratio": candidate.bbox_to_area_ratio,
+        "boundary_warnings": boundary_warning_messages(
+            candidate, requested_kind=requested_kind
+        ),
         "sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -317,6 +463,67 @@ def _get_json(url: str) -> object:
         raise GeoWatchError(
             "Boundary service is unavailable. Use a local boundary file."
         ) from exc
+
+
+def _candidate_rank(
+    candidate: BoundaryCandidate,
+    location: str,
+    boundary_kind: BoundarySearchKind,
+) -> tuple[int, float, str]:
+    """Rank candidates by requested administrative intent and plausibility."""
+    level = _admin_level_int(candidate)
+    preferred_levels: dict[BoundarySearchKind, tuple[int, ...]] = {
+        "auto": (5, 6, 7, 8, 4),
+        "city": (6, 7, 8, 9),
+        "district": (5, 6, 7),
+        "state": (3, 4),
+        "urban": (8, 9, 10, 7),
+    }
+    if level is None:
+        level_penalty = 5
+    else:
+        level_penalty = min(
+            abs(level - value) for value in preferred_levels[boundary_kind]
+        )
+    text = _normalize_name(f"{candidate.name} {candidate.display_name}")
+    location_text = _normalize_name(location)
+    name_penalty = 0 if location_text and location_text in text else 2
+    dispersed_penalty = (
+        6
+        if boundary_kind in {"auto", "city", "urban"}
+        and candidate.is_spatially_dispersed
+        else 0
+    )
+    area_penalty = log10(max(candidate.area_sq_km, 1.0))
+    if boundary_kind == "state":
+        area_penalty = 0.0
+    return (
+        level_penalty + name_penalty + dispersed_penalty,
+        area_penalty,
+        candidate.display_name,
+    )
+
+
+def _admin_level_int(candidate: BoundaryCandidate) -> int | None:
+    """Return numeric OSM admin_level when available."""
+    if candidate.administrative_level is None:
+        return None
+    try:
+        return int(candidate.administrative_level)
+    except ValueError:
+        return None
+
+
+def _normalize_name(value: str) -> str:
+    """Normalize display names for loose ranking comparisons."""
+    return " ".join(
+        unicodedata.normalize("NFKD", value)
+        .encode("ascii", errors="ignore")
+        .decode("ascii")
+        .casefold()
+        .replace(",", " ")
+        .split()
+    )
 
 
 def _optional_string(value: object) -> str | None:
